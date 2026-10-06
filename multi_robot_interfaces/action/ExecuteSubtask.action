@@ -1,0 +1,47 @@
+# Sent by the coordinator (action client) to one robot (action server) to
+# execute a single subtask of a global mission.
+
+# GOAL 
+string mission_id # Unique identifier of the global mission being executed
+string subtask_id # Unique identifier of the subtask within the global mission
+string task_type     # High-level robot task to execute, e.g. "navigate", "pick", "place", "inspect"
+geometry_msgs/PoseStamped target_pose         # Target pose where the robot must perform the subtask, expressed in a known frame (e.g. map)
+diagnostic_msgs/KeyValue[] parameters   # Task-specific parameters such as work duration, object type, payload, or mode
+float32 timeout_sec                     # Maximum allowed execution time for this subtask; 0 means no timeout
+
+
+---
+# RESULT 
+uint8 ERROR_NONE=0            # No error: subtask completed successfully
+uint8 ERROR_CANCELED=1        # Subtask was canceled by the client or coordinator or supervisor
+uint8 ERROR_TIMEOUT=2         # Subtask exceeded its allowed time budget
+uint8 ERROR_HARDWARE_FAULT=3  # Robot hardware or system-level failure occurred
+uint8 ERROR_INVALID_GOAL=4    # The goal provided by the client was invalid or badly formed
+uint8 ERROR_NAVIGATION_FAILED=5 # Navigation to the target pose failed
+uint8 ERROR_UNSUPPORTED_TASK=6 # The requested task type is not supported by the robot
+
+bool success                         # Whether the subtask was completed successfully
+uint8 error_code                     # Numeric error code from the list above
+string message                        # Human-readable message describing the result of the subtask outcomes
+float32 execution_time_sec            # Total time taken to execute the subtask
+float32 navigation_time_sec           # Time spent in the navigation phase
+float32 distance_remaining            # Remaining distance to the goal at the end of execution
+int16 number_of_recoveries            # Number of navigation recovery attempts executed  during the subtask
+geometry_msgs/PoseStamped final_pose  # Final pose reached by the robot at the end of the subtask
+---
+
+# FEEDBACK 
+uint8 STATE_NAVIGATING=0                # Robot is moving toward the target pose
+uint8 STATE_WORKING=1                   # Robot is performing the task at the target
+uint8 STATE_BLOCKED=2                   # Robot cannot progress, e.g. obstacle or blocked stat
+
+string robot_name                       # Name of the robot reporting this feedback
+uint8 state                             # Current execution state of the robot  for this subtask(NAVIGATING, WORKING, BLOCKED)
+float32 progress                        # Execution progress from 0.0 to 1.0
+geometry_msgs/PoseStamped current_pose  # Current pose of the robot in the world frame during the subtask
+float32 estimated_time_remaining_sec    # Estimated time remaining before completion
+float32 distance_remaining              # Remaining distance to the target goal at the current moment
+float32 navigation_time_sec             # Time spent in the navigation phase so far
+int16 number_of_recoveries              # Number of navigation recovery attempts already triggered by Nav2
+string status_message                   # Human-readable message describing the current status (progress or problem) of the subtask
+
