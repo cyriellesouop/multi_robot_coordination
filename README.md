@@ -91,7 +91,7 @@ Defines the messages exchanged between the coordinator and the robots. It contai
 **`ExecuteSubtask` in brief**
 
 - **Goal** (coordinator → robot): `mission_id`, `subtask_id`, `task_type` (`navigate`, `pick`, `place`,
-  `inspect`, ...), `target_pose` (`PoseStamped`), task-specific `parameters` (key/value list), `timeout_sec`.
+  `inspect`, ...), `target_pose` (`PoseStamped`), task-specific `parameters` (key/value list), `timeout_sec` (must be greater than 0).
 - **Result** (robot → coordinator): `success`, `error_code` (`ERROR_NONE`, `ERROR_CANCELED`, `ERROR_TIMEOUT`,
   `ERROR_HARDWARE_FAULT`, `ERROR_INVALID_GOAL`, `ERROR_NAVIGATION_FAILED`, `ERROR_UNSUPPORTED_TASK`), `message`,
   execution and navigation times, remaining distance, number of recoveries, `final_pose`.
@@ -105,9 +105,9 @@ Run `ros2 interface show multi_robot_interfaces/action/ExecuteSubtask` to see th
 
 | File | Purpose |
 |---|---|
-| `src/robot_action_server.cpp` | **Mock robot.** Action server `robot_action_server` on `execute_subtask`. Accepts every goal, then aborts it if the task type is empty or not one of `navigate`, `deliver`, `inspect`. Simulates navigation in 5 steps of 1 s while publishing feedback, and checks for cancellation and timeout at every step. Only `navigate` runs to completion so far. |
-| `src/coordinator_action_client.cpp` | **Coordinator.** Action client node `coordinator_action_client`. Currently a skeleton, not yet built (no target in `CMakeLists.txt`). |
-| `CMakeLists.txt` | Builds and installs the `robot_action_server` executable. |
+| `src/robot_action_server.cpp` | **Mock robot.** Action server `robot_action_server` on `execute_subtask`. Accepts every goal, then aborts it with `ERROR_INVALID_GOAL` if the task type is empty or `timeout_sec` is not greater than 0, or with `ERROR_UNSUPPORTED_TASK` if the task type is not one of `navigate`, `deliver`, `inspect`. Simulates navigation in 5 steps of 1 s while publishing feedback, and checks for cancellation and timeout at every step and once more after the last step. Only `navigate` runs to completion so far. |
+| `src/coordinator_action_client.cpp` | **Coordinator.** Action client node `coordinator_action_client`. Waits for the `execute_subtask` server, sends one hard-coded `navigate` goal (mission `mission1`, subtask `subtask1`, timeout 30 s), logs the final status and result fields, then shuts down. It does not use feedback or cancellation yet. |
+| `CMakeLists.txt` | Builds and installs the `robot_action_server` and `coordinator_action_client` executables. |
 | `package.xml` | Package manifest: depends on `rclcpp`, `rclcpp_action`, `multi_robot_interfaces`, `geometry_msgs` and `diagnostic_msgs`. |
 
 ## Build
@@ -142,11 +142,20 @@ ros2 action send_goal /execute_subtask multi_robot_interfaces/action/ExecuteSubt
 You should see five feedback messages, then a result with status `SUCCEEDED`. Press `Ctrl+C` during
 execution to request a cancellation.
 
+Or, with the mock robot running, start the coordinator client in a second terminal instead:
+
+```bash
+ros2 run actions coordinator_action_client
+```
+
+After about 5 s it logs the result (`SUCCEEDED`, `error_code=0`, execution and navigation times) and exits.
+A goal with `timeout_sec` of 0 or less is aborted with `error_code=4` (`ERROR_INVALID_GOAL`).
+
 ## Status
 
 - [x] `ExecuteSubtask` action interface
 - [x] Mock robot action server (first version)
-- [ ] Coordinator action client
+- [x] Coordinator action client (first version: sends one goal and logs the result)
 - [ ] Workflow model (subtask DAG and dependency conditions)
 - [ ] Deviation detection
 - [ ] Impact analysis and local workflow repair
@@ -154,6 +163,10 @@ execution to request a cancellation.
 - [ ] Nova Carter robot server (Nav2)
 
 ## Changelog
+
+### 2026-10-06 - Add coordinator client and validate timeout_sec
+- The coordinator client now sends a goal and logs the result; the robot server rejects `timeout_sec` <= 0 and detects a timeout after the last step.
+- Build with `colcon build --packages-select multi_robot_interfaces actions`, then run `ros2 run actions coordinator_action_client` with the robot server running.
 
 ### 2026-10-06 - Document project overview and repository layout
 - Rewrote the README: project goal, architecture, repository layout, status checklist.

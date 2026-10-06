@@ -103,13 +103,21 @@ rclcpp_action::CancelResponse cancel_callback(
             return;
         }
 
+        if(goal->timeout_sec <= 0.0){
+            result->success = false;
+            result->error_code = ExecuteSubtask::Result::ERROR_INVALID_GOAL;
+            result->message = "Invalid goal, timeout_sec must be > 0";
+            goal_handle->abort(result);
+            return;
+        }
+
         // --- setup a dummy Nav2 path to target ---
     // For now, we simulate navigation; later, replace this with a real Nav2 client.
     auto current_pose = target_pose;
     current_pose.pose.position.x = 0.0;
     current_pose.pose.position.y = 0.0;
     
-    const double timeout_sec = goal->timeout_sec > 0.0 ? goal->timeout_sec : 30.0;
+    const double timeout_sec = goal->timeout_sec;
     const auto timeout_deadline = this->now() + rclcpp::Duration::from_seconds(timeout_sec);
 
     float progress = 0.0f;
@@ -128,14 +136,15 @@ rclcpp_action::CancelResponse cancel_callback(
             result->message="goal cancelled by the coordinatoor";
             goal_handle->abort(result);
             return;
-    }
-    if(this->now() > timeout_deadline){
+        }
+        if(this->now() > timeout_deadline){
             result->success = false;
             result->error_code= ExecuteSubtask::Result::ERROR_TIMEOUT;
             result->message="Subtask timeout exceeded";
             goal_handle->abort(result);
             return;
         }
+
 
         progress = (step+1) / 5.0f;
         navigation_time_sec = (this->now() - start_time).seconds();
@@ -158,6 +167,16 @@ rclcpp_action::CancelResponse cancel_callback(
         loop_rate.sleep();
     }
 
+    // check if the subtask has timed out after the navigation loop
+    if(this->now() > timeout_deadline){
+        result->success = false;
+        result->error_code= ExecuteSubtask::Result::ERROR_TIMEOUT;
+        result->message="Subtask timeout exceeded";
+        goal_handle->abort(result);
+        return;
+    }
+    // update the navigation time after the navigation loop
+     navigation_time_sec = (this->now() - start_time).seconds();
     //after navigation success, do task-specific operation
     if(task_type == "navigate"){
         //finish as soon as navigation is done

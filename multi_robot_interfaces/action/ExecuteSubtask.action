@@ -7,7 +7,8 @@ string subtask_id # Unique identifier of the subtask within the global mission
 string task_type     # High-level robot task to execute, e.g. "navigate", "pick", "place", "inspect"
 geometry_msgs/PoseStamped target_pose         # Target pose where the robot must perform the subtask, expressed in a known frame (e.g. map)
 diagnostic_msgs/KeyValue[] parameters   # Task-specific parameters such as work duration, object type, payload, or mode
-float32 timeout_sec                     # Maximum allowed execution time for this subtask; 0 means no timeout
+float32 timeout_sec                     # Maximum allowed execution time for this subtask; must be > 0; goals with 0 or less are rejected as invalid.
+
 
 
 ---

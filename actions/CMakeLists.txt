@@ -16,6 +16,13 @@ find_package(diagnostic_msgs REQUIRED)
 add_executable(robot_action_server src/robot_action_server.cpp)   
 ament_target_dependencies(robot_action_server rclcpp rclcpp_action multi_robot_interfaces geometry_msgs diagnostic_msgs)
 
-install(TARGETS robot_action_server DESTINATION lib/${PROJECT_NAME}/) # After building, copy the executable robot_action_server into the install directory so ROS 2 can find and run it
+add_executable(coordinator_action_client src/coordinator_action_client.cpp)
+ament_target_dependencies(coordinator_action_client rclcpp rclcpp_action multi_robot_interfaces geometry_msgs diagnostic_msgs)
+
+install(TARGETS 
+robot_action_server 
+coordinator_action_client
+DESTINATION lib/${PROJECT_NAME}/
+) # After building, copy the executable robot_action_server into the install directory so ROS 2 can find and run it
 
 ament_package()
