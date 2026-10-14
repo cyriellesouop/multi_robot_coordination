@@ -42,6 +42,112 @@ drive **NVIDIA Nova Carter** robots through Nav2. The workflow model, the deviat
 algorithm must not depend on a specific robot, so that a robot can be replaced without changing the core
 algorithm.
 
+## Time budgets and time estimates
+
+### Who decides what
+
+The coordinator and the robots make two different decisions about time:
+
+| | Coordinator | Robot |
+|---|---|---|
+| Knows | the workflow, the dependencies between subtasks, the deadlines | its position, speed, battery and capabilities |
+| Decides | **what** to do and **by when** (the `timeout_sec` budget of each goal) | **whether it can** finish in that budget, and **how long** it will take |
+
+The coordinator turns each subtask's deadline into a time budget when it sends the goal
+(`timeout_sec = deadline - now`). The robot never changes that budget. It can only refuse a goal it
+cannot finish in time. Refusing at the start costs nothing, while a timeout at the end wastes the whole
+budget and delays the subtasks that depend on it. This is the same idea as the Contract Net Protocol used
+in multi-robot task allocation, where a robot answers whether it can take a task before it is assigned.
+
+### Accept, reject, abort
+
+- **Rejected** (in the robot's `goal_callback`): the subtask never started. Used for anything the robot can
+  decide instantly: missing ids, unsupported task type, invalid or too short time budget, subtask already
+  completed, robot busy. The coordinator should send the subtask to another robot or fix the request.
+  A rejection carries no reason; the robot logs it (`[WARN]`, also visible on `/rosout`).
+- **Aborted** (during execution): the subtask started and failed, for example on a timeout. Time has been
+  spent, so this is a real deviation for the coordinator to analyse.
+
+### Detecting a deviation before the timeout
+
+The robot reports `estimated_time_remaining_sec` in its feedback: the time it still needs to **complete**
+the subtask, not the time left before the timeout. The coordinator can compute the time left before the
+deadline by itself; only the robot knows how long it still needs. The coordinator then computes:
+
+```
+margin = time left before the deadline - estimated time to completion
+```
+
+A negative margin means the subtask is at risk, possibly long before its timeout fires. For example, with
+`timeout_sec = 30`, 10 s after the start:
+
+| | On track | Blocked at 50 % |
+|---|---|---|
+| Time left before the deadline | 20 s | 20 s |
+| Estimated time to completion | 10 s | 40 s |
+| Margin | +10 s | -20 s: at risk now, 20 s before the timeout |
+
+The margin is computed in the **coordinator**, not in the robot: the deadline belongs to the workflow, the
+impact on downstream subtasks requires the dependency graph, and keeping this logic in one place keeps the
+robot side robot-agnostic.
+
+### How a robot estimates its time
+
+- **Mock robot (now):** a fixed duration, 5 steps of 1 s (`kNavigationSteps` x `kStepDurationSec`).
+- **Nova Carter with Nav2 (later):**
+  1. current position from localization (TF transform `map` -> `base_link`),
+  2. path to the target from the Nav2 planner (`ComputePathToPose`), summing its segment lengths,
+  3. distance divided by an average speed derived from the controller parameters,
+  4. plus the work at the target (for example an inspection duration from the goal `parameters`),
+  5. corrected with past measurements (estimated against actual durations).
+
+  During execution, Nav2's `NavigateToPose` feedback already provides estimated time remaining, distance
+  remaining, navigation time and number of recoveries, which is why `ExecuteSubtask` feedback mirrors them.
+  Because `goal_callback` must answer quickly, a real robot would only use a fast bound there (straight-line
+  distance divided by maximum speed) and compute the full estimate elsewhere.
+
+### Planned evolution
+
+Today the robot's own check (budget longer than its expected duration) is the only feasibility check. To
+choose between robots during allocation and repair, the coordinator will need each robot's estimate
+**before** sending a goal. The planned design is:
+
+- each robot exposes an estimation service ("how long would you need for this subtask?"),
+- the coordinator compares the estimates with the deadline and chooses the robot,
+- the robot's check in `goal_callback` stays as a safety net.
+
+### Time source
+
+All durations are measured with the node clock (`this->now()`). On a real robot this is the system time.
+In simulation (Isaac Sim or Gazebo with `use_sim_time:=true`), the clock follows the simulator's `/clock`
+topic, so the same code works in both cases.
+
+## Recording and replaying executions with rosbag
+
+`ros2 bag` records ROS 2 topics to a file and replays them later. It does not estimate or decide anything,
+but it supports the project in several ways:
+
+- **Calibrating time estimates:** record many executions (goals, feedback, results), then compare each
+  robot's estimated and actual durations offline to correct its estimator.
+- **Testing the deviation detector reproducibly:** record a run where a robot gets delayed or blocked, then
+  replay it as often as needed while developing detection, with exactly the same input every time.
+- **Evaluating repair strategies:** run the same recorded scenarios against different repair strategies and
+  compare the results (subtasks still at risk, changes to the workflow, added delay).
+- **Post-mortem analysis:** when a mission fails, the recording shows which subtask deviated first and how
+  the failure spread through the dependencies.
+
+Action feedback and goal status are published on hidden topics, so they must be included explicitly:
+
+```bash
+ros2 bag record --include-hidden-topics -o run1 \
+  /execute_subtask/_action/feedback /execute_subtask/_action/status /rosout
+ros2 bag play run1
+```
+
+Replaying a bag republishes the messages but does not recreate the action server or the goal handles. To
+benefit from replay, the deviation detector should take its input (feedback, deadlines) in a form that can
+come either from a live action client or from recorded messages.
+
 ## Repository layout
 
 This repository is the `src/` folder of a colcon workspace.
@@ -49,6 +155,7 @@ This repository is the `src/` folder of a colcon workspace.
 ```
 src/
 ├── README.md
+├── TESTING.md
 ├── .gitignore
 ├── .vscode/
 │   └── c_cpp_properties.json
@@ -73,6 +180,7 @@ src/
 | File | Purpose |
 |---|---|
 | `README.md` | This file: project overview, layout, build and run instructions. |
+| `TESTING.md` | Manual tests for the mock robot server: build, commands to type and expected results for each accept, reject, cancel and retry case. |
 | `.gitignore` | Keeps colcon output (`build/`, `install/`, `log/`) and Python caches out of the repository. |
 | `.vscode/c_cpp_properties.json` | VS Code IntelliSense configuration with the ROS 2 Humble include paths, so the editor can resolve `rclcpp` and the generated interface headers. |
 | `.claude/settings.json` | Claude Code project settings: no AI attribution in commits, and a confirmation prompt before every `git commit` and `git push`. |
@@ -105,7 +213,7 @@ Run `ros2 interface show multi_robot_interfaces/action/ExecuteSubtask` to see th
 
 | File | Purpose |
 |---|---|
-| `src/robot_action_server.cpp` | **Mock robot.** Action server `robot_action_server` on `execute_subtask`. Accepts every goal, then aborts it with `ERROR_INVALID_GOAL` if the task type is empty or `timeout_sec` is not greater than 0, or with `ERROR_UNSUPPORTED_TASK` if the task type is not one of `navigate`, `deliver`, `inspect`. Simulates navigation in 5 steps of 1 s while publishing feedback, and checks for cancellation and timeout at every step and once more after the last step. Only `navigate` runs to completion so far. |
+| `src/robot_action_server.cpp` | **Mock robot.** Action server `robot_action_server` on `execute_subtask`. Rejects a goal if `mission_id` or `subtask_id` is empty, if the task type is not `navigate` (the only task implemented so far), if `timeout_sec` is not greater than the 5 s it needs, if the same subtask already succeeded, or if it is busy with another subtask. Executes accepted goals in a separate thread: simulates navigation in 5 steps of 1 s while publishing feedback (progress and estimated time to completion), and checks for cancellation and timeout at every step and once more after the last step. Successful subtasks are remembered; failed or canceled ones can be retried. See [TESTING.md](TESTING.md) for manual tests. |
 | `src/coordinator_action_client.cpp` | **Coordinator.** Action client node `coordinator_action_client`. Waits for the `execute_subtask` server, sends one hard-coded `navigate` goal (mission `mission1`, subtask `subtask1`, timeout 30 s), logs the final status and result fields, then shuts down. It does not use feedback or cancellation yet. |
 | `CMakeLists.txt` | Builds and installs the `robot_action_server` and `coordinator_action_client` executables. |
 | `package.xml` | Package manifest: depends on `rclcpp`, `rclcpp_action`, `multi_robot_interfaces`, `geometry_msgs` and `diagnostic_msgs`. |
@@ -149,7 +257,8 @@ ros2 run actions coordinator_action_client
 ```
 
 After about 5 s it logs the result (`SUCCEEDED`, `error_code=0`, execution and navigation times) and exits.
-A goal with `timeout_sec` of 0 or less is aborted with `error_code=4` (`ERROR_INVALID_GOAL`).
+A goal with `timeout_sec` of 5 s or less (or 0 or negative) is rejected by the robot, and the client does not handle rejections yet, so it keeps waiting (stop it with `Ctrl+C`).
+See [TESTING.md](TESTING.md) for the complete list of manual tests.
 
 ## Status
 
@@ -163,6 +272,10 @@ A goal with `timeout_sec` of 0 or less is aborted with `error_code=4` (`ERROR_IN
 - [ ] Nova Carter robot server (Nav2)
 
 ## Changelog
+
+### 2026-10-14 - Accept or reject goals in the robot server
+- The mock robot now rejects invalid, unsupported, too short, duplicate or concurrent subtasks in `goal_callback`, runs accepted goals in a separate thread, reports `CANCELED` on cancellation and reports time to completion in its feedback.
+- Added [TESTING.md](TESTING.md) with the manual test commands, and documented time budgets and rosbag usage. Build with `colcon build --packages-select actions`.
 
 ### 2026-10-06 - Add coordinator client and validate timeout_sec
 - The coordinator client now sends a goal and logs the result; the robot server rejects `timeout_sec` <= 0 and detects a timeout after the last step.
