@@ -213,8 +213,8 @@ Run `ros2 interface show multi_robot_interfaces/action/ExecuteSubtask` to see th
 
 | File | Purpose |
 |---|---|
-| `src/robot_action_server.cpp` | **Mock robot.** Action server `robot_action_server` on `execute_subtask`. Rejects a goal if `mission_id` or `subtask_id` is empty, if the task type is not `navigate` (the only task implemented so far), if `timeout_sec` is not greater than the 5 s it needs, if the same subtask already succeeded, or if it is busy with another subtask. Executes accepted goals in a separate thread: simulates navigation in 5 steps of 1 s while publishing feedback (progress and estimated time to completion), and checks for cancellation and timeout at every step and once more after the last step. Successful subtasks are remembered; failed or canceled ones can be retried. See [TESTING.md](TESTING.md) for manual tests. |
-| `src/coordinator_action_client.cpp` | **Coordinator.** Action client node `coordinator_action_client`. Waits for the `execute_subtask` server, sends one hard-coded `navigate` goal (mission `mission1`, subtask `subtask1`, timeout 30 s), logs the final status and result fields, then shuts down. It does not use feedback or cancellation yet. |
+| `src/robot_action_server.cpp` | **Mock robot.** Action server `robot_action_server` on `execute_subtask`. Rejects a goal if `mission_id` or `subtask_id` is empty, if the task type is not `navigate` (the only task implemented so far), if `timeout_sec` is not greater than the 5 s it needs, if the same subtask already succeeded, or if it is busy with another subtask. Executes accepted goals in a separate thread: simulates navigation in 5 steps of 1 s while publishing feedback (progress and estimated time to completion), and checks for cancellation and timeout at every step and once more after the last step. Successful subtasks are remembered; failed or canceled ones can be retried. It can simulate a deviation: with the parameter `simulated_delay_sec` greater than 0, the robot gets blocked for that many seconds at step `delay_at_step` (default 2), publishes `BLOCKED` feedback with a growing time estimate and one recovery, and still honours cancellation and timeout. See [TESTING.md](TESTING.md) for manual tests. |
+| `src/coordinator_action_client.cpp` | **Coordinator.** Action client node `coordinator_action_client`. Waits for the `execute_subtask` server, sends one hard-coded `navigate` goal (mission `mission1`, subtask `subtask1`, timeout 30 s), logs whether the goal was accepted or rejected, then each feedback message (progress, state, time needed, time left before the deadline and the margin between them), then the final status and result fields, and shuts down (also when the goal is rejected). It warns when the robot reports `BLOCKED` and when the margin becomes negative (subtask at risk). The deadline is currently the goal's own `timeout_sec`; it will come from the workflow model. It does not cancel goals or repair the workflow yet. |
 | `CMakeLists.txt` | Builds and installs the `robot_action_server` and `coordinator_action_client` executables. |
 | `package.xml` | Package manifest: depends on `rclcpp`, `rclcpp_action`, `multi_robot_interfaces`, `geometry_msgs` and `diagnostic_msgs`. |
 
@@ -257,7 +257,16 @@ ros2 run actions coordinator_action_client
 ```
 
 After about 5 s it logs the result (`SUCCEEDED`, `error_code=0`, execution and navigation times) and exits.
-A goal with `timeout_sec` of 5 s or less (or 0 or negative) is rejected by the robot, and the client does not handle rejections yet, so it keeps waiting (stop it with `Ctrl+C`).
+A goal with `timeout_sec` of 5 s or less (or 0 or negative) is rejected by the robot; the client logs the rejection and exits.
+
+To see a deviation detected before the timeout, restart the robot with a simulated blockage of 30 s and run the client again:
+
+```bash
+ros2 run actions robot_action_server --ros-args -p simulated_delay_sec:=30.0
+ros2 run actions coordinator_action_client
+```
+
+The client logs `BLOCKED` warnings from about 2 s, an `AT RISK` warning from about 15 s (when the time left before the deadline becomes shorter than the time the robot needs), and the goal ends `ABORTED` with `ERROR_TIMEOUT` at 30 s. Restart the robot between runs of the same subtask, because it rejects a subtask that already succeeded.
 See [TESTING.md](TESTING.md) for the complete list of manual tests.
 
 ## Status
@@ -266,12 +275,16 @@ See [TESTING.md](TESTING.md) for the complete list of manual tests.
 - [x] Mock robot action server (first version)
 - [x] Coordinator action client (first version: sends one goal and logs the result)
 - [ ] Workflow model (subtask DAG and dependency conditions)
-- [ ] Deviation detection
+- [ ] Deviation detection (first step done: the client warns on `BLOCKED` and on a negative margin; no workflow or impact analysis yet)
 - [ ] Impact analysis and local workflow repair
 - [ ] Unit and integration tests
 - [ ] Nova Carter robot server (Nav2)
 
 ## Changelog
+
+### 2026-10-14 - Detect deviations from feedback and simulate a blocked robot
+- The coordinator client logs accepted or rejected goals and every feedback message, and warns on `BLOCKED` and on a negative margin (deadline minus estimated time to completion). The mock robot can simulate a blockage with `simulated_delay_sec`; cancel and timeout checks and feedback publishing were moved into helper methods.
+- Run `ros2 run actions robot_action_server --ros-args -p simulated_delay_sec:=30.0`, then `ros2 run actions coordinator_action_client`; build with `colcon build --packages-select actions`.
 
 ### 2026-10-14 - Accept or reject goals in the robot server
 - The mock robot now rejects invalid, unsupported, too short, duplicate or concurrent subtasks in `goal_callback`, runs accepted goals in a separate thread, reports `CANCELED` on cancellation and reports time to completion in its feedback.
