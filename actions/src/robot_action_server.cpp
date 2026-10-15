@@ -1,7 +1,9 @@
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "multi_robot_interfaces/action/execute_subtask.hpp"
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <set>
 #include <string>
@@ -16,6 +18,14 @@ class RobotActionServerNode : public rclcpp::Node // MODIFY NAME
 public:
     RobotActionServerNode() : Node("robot_action_server") // MODIFY NAME
     {
+        // Callback group for the action server's callbacks (goal, cancel, accepted).
+        // MutuallyExclusive: these callbacks never run at the same time, so two goals arriving together
+        // cannot both see busy_ == false and both be accepted. They are short, so this costs nothing;
+        // the long work (execute_goal) runs in its own thread, and the multi-threaded executor in main()
+        // keeps other callbacks (e.g. parameter services) responsive.
+        // Later, the Nova Carter server will put its Nav2 action client in a second group.
+        callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
         // parameters to simulate a deviation (default: no deviation)
         this->declare_parameter("simulated_delay_sec", 0.0); // simulated_delay_sec: how long the robot stays blocked during navigation, 0 = never blocked
         this->declare_parameter("delay_at_step", 2);         // delay_at_step: navigation step at which the robot gets blocked (0 to kNavigationSteps - 1)
@@ -27,23 +37,35 @@ public:
             // to bind the goal callback function to the server
             std::bind(&RobotActionServerNode::goal_callback, this, _1, _2),
             std::bind(&RobotActionServerNode::cancel_callback, this, _1),         // 1 because we only pass one argument (the goal handle) on the cancel callback
-            std::bind(&RobotActionServerNode::handle_accepted_callback, this, _1) // bind the handle accepted callback function to the server
+            std::bind(&RobotActionServerNode::handle_accepted_callback, this, _1), // bind the handle accepted callback function to the server
+            rcl_action_server_get_default_options(), 
+            callback_group_
         );
         RCLCPP_INFO(this->get_logger(), "Action server has been started");
     }
 
-private:
-    // create action server and store it inside this node class : RobotActionServerNode
-    rclcpp_action::Server<ExecuteSubtask>::SharedPtr robot_action_server_; // it is a smart pointer that will point to a server object created later.
+    // Wait for the execution thread before the node is destroyed: the thread uses the node (this),
+    // so it must not outlive it. After Ctrl+C, rclcpp::ok() becomes false and the thread stops
+    // within one check period (see wait_step).
+    ~RobotActionServerNode()
+    {
+        if (execution_thread_.joinable())
+            execution_thread_.join();
+    }
 
-    // goal_callback runs in the node's thread and execute_goal in its own thread, so shared state must be thread-safe
+private:
+
+    // goal_callback runs in the executor's threads and execute_goal in its own thread, so shared state must be thread-safe
     std::atomic<bool> busy_{false}; // true while a subtask executes
     std::mutex completed_mutex_;
     std::set<std::string> completed_subtasks_; // keys "mission_id/subtask_id": subtask_id is only unique inside its mission, so subtask1 of mission1 and subtask1 of mission2 are different subtasks.
+    std::thread execution_thread_;             // thread running execute_goal for the current subtask
 
     // constants for the simulated navigation duration
     static constexpr int kNavigationSteps = 5;
     static constexpr double kStepDurationSec = 1.0;
+    // how often cancel requests are checked while the robot waits: a cancel is honoured within this time
+    static constexpr double kCheckPeriodSec = 0.1;
 
     // called when the coordinator sends a goal: decide whether this robot takes the subtask
     rclcpp_action::GoalResponse goal_callback(
@@ -110,25 +132,29 @@ private:
             }
         }
 
-        // 7. robot already executing another subtask
-        if (busy_)
+        // 7. robot already executing another subtask.
+        //    Check and claim in one atomic step: if busy_ is false, set it to true and accept;
+        //    otherwise reject. No other goal can slip in between the check and the claim.
+        bool expected_free = false;
+        if (!busy_.compare_exchange_strong(expected_free, true))
         {
             RCLCPP_WARN(this->get_logger(), "Rejecting subtask '%s': robot is busy", goal->subtask_id.c_str());
             return rclcpp_action::GoalResponse::REJECT;
         }
 
-        // all checks passed: claim the robot before accepting
-        busy_ = true;
+        // all checks passed and the robot is now claimed (busy_ == true)
         RCLCPP_INFO(this->get_logger(), "Accepting subtask '%s'", goal->subtask_id.c_str());
         return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
     }
 
-    // create a cancel callback function here
-    //  it is executed when a client requests to cancel an ongoing goal
+    // Executed when a client requests to cancel an ongoing goal.
+    // Accepting only marks the goal as "canceling": execute_goal sees it (is_canceling()), stops the robot
+    // and sends the CANCELED result with what was done so far.
+    // A real robot could return REJECT when stopping is unsafe (e.g. in the middle of placing an object).
     rclcpp_action::CancelResponse cancel_callback(
         const std::shared_ptr<ExecuteSubtaskGoalHandle> goal_handle)
     {
-        (void)goal_handle;
+        RCLCPP_INFO(this->get_logger(), "Received request to cancel subtask '%s'", goal_handle->get_goal()->subtask_id.c_str());
         return rclcpp_action::CancelResponse::ACCEPT;
     }
 
@@ -138,15 +164,18 @@ private:
     {
         RCLCPP_INFO(this->get_logger(), "Executing the goal");
 
-        // run execute_goal in a separate thread to avoid blocking the node's thread, and release the robot when it ends.
-        // .detach() lets the thread run on its own while handle_accepted_callback returns immediately,
-        // so the node goes back to receiving goals and cancel requests.
-        std::thread{[this, goal_handle]()
-                    {
-                        execute_goal(goal_handle);
-                        busy_ = false; // robot is free again, whatever way execute_goal ended
-                    }}
-            .detach();
+        // The previous subtask's thread has already finished execute_goal (otherwise busy_ would still be
+        // true and this goal would have been rejected); join it to release it before starting a new one.
+        if (execution_thread_.joinable())
+            execution_thread_.join();
+
+        // run execute_goal in a separate thread so handle_accepted_callback returns immediately
+        // and the node keeps receiving goals and cancel requests while the robot works.
+        execution_thread_ = std::thread{[this, goal_handle]()
+                                        {
+                                            execute_goal(goal_handle);
+                                            busy_ = false; // robot is free again, whatever way execute_goal ended
+                                        }};
     }
 
     // runs in its own thread: executes the subtask and sets its final state (succeed, abort or canceled)
@@ -171,6 +200,7 @@ private:
         const auto target_pose = goal->target_pose;
         const auto start_time = this->get_clock()->now();
         // read the deviation parameters for this goal; they are read at every goal, so they can be changed
+        // between goals with: ros2 param set /robot_action_server simulated_delay_sec <seconds>
         const double delay_sec = this->get_parameter("simulated_delay_sec").as_double();
         const int delay_at_step = static_cast<int>(this->get_parameter("delay_at_step").as_int());
 
@@ -179,7 +209,6 @@ private:
             "Executing subtask '%s' of mission '%s' on robot '%s'",
             subtask_id.c_str(), mission_id.c_str(), this->get_name());
 
-        // between goals with: ros2 param set /robot_action_server simulated_delay_sec <seconds>
         if (delay_sec > 0.0)
         {
             RCLCPP_WARN(this->get_logger(), "Simulated deviation: subtask '%s' will be blocked for %.1f s at step %d",
@@ -199,6 +228,11 @@ private:
         float navigation_time_sec = 0.0f;
         int16_t recoveries = 0;
 
+        // a cancel can arrive between acceptance and the start of this thread: honour it before doing anything
+        if (stop_if_canceled_or_timed_out(goal_handle, result, timeout_deadline, " before execution",
+                                          start_time, progress, recoveries, current_pose))
+            return;
+
         // --- simulate navigation
         // in this simulation loop, we are publishing feedback repeatedly
         for (int step = 0; step < kNavigationSteps; ++step)
@@ -210,46 +244,49 @@ private:
             if (step == delay_at_step && delay_sec > 0.0)
             {
                 const auto blocked_start = this->now();
-                ++recoveries; // a blocked robot triggers a recovery attempt, as Nav2 would
-                rclcpp::Rate blocked_rate(1.0 / kStepDurationSec);
+                ++recoveries;                                           // a blocked robot triggers a recovery attempt, as Nav2 would
+                progress = step / static_cast<float>(kNavigationSteps); // no progress while blocked
 
                 while ((this->now() - blocked_start).seconds() < delay_sec)
                 {
                     // cancel and timeout must still work while the robot is blocked
-                    if (stop_if_canceled_or_timed_out(goal_handle, result, timeout_deadline, " while blocked"))
+                    if (stop_if_canceled_or_timed_out(goal_handle, result, timeout_deadline, " while blocked",
+                                                      start_time, progress, recoveries, current_pose))
                         return;
 
                     // the robot does not know how long it will stay blocked: its estimate is the remaining
                     // navigation plus the time already lost, so it grows the longer the robot is blocked
                     const double blocked_sec = (this->now() - blocked_start).seconds();
-                    progress = step / static_cast<float>(kNavigationSteps); // no progress while blocked
 
                     publish_feedback(goal_handle, ExecuteSubtask::Feedback::STATE_BLOCKED, progress,
                                      (kNavigationSteps - step) * kStepDurationSec + blocked_sec,
                                      recoveries, start_time, current_pose, "Robot is blocked");
 
-                    blocked_rate.sleep();
+                    wait_step(goal_handle);
                 }
                 RCLCPP_INFO(this->get_logger(), "Subtask '%s' is no longer blocked, resuming navigation", subtask_id.c_str());
             }
 
             // stop here if the coordinator canceled the goal or the time budget is exhausted
-            if (stop_if_canceled_or_timed_out(goal_handle, result, timeout_deadline, " while navigating"))
+            if (stop_if_canceled_or_timed_out(goal_handle, result, timeout_deadline, " while navigating",
+                                              start_time, progress, recoveries, current_pose))
                 return;
+
             // feedback is published at the start of each step, so it describes the work already done
             progress = step / static_cast<float>(kNavigationSteps); // fraction already done
             publish_feedback(goal_handle, ExecuteSubtask::Feedback::STATE_NAVIGATING, progress,
                              (kNavigationSteps - step) * kStepDurationSec,
                              recoveries, start_time, current_pose, "Navigating to target pose");
 
-            // Rate means : Wait kStepDurationSec before continuing to the next iteration of this loop. This is used to slow down a loop so it does not run too fast.
-            //  useful for visualizing progress, simulating realistic robot operation timing
-            rclcpp::Rate loop_rate(1.0 / kStepDurationSec);
-            loop_rate.sleep();
+            // wait kStepDurationSec to simulate the time the step takes (returns early on a cancel request)
+            wait_step(goal_handle);
+            if (!goal_handle->is_canceling())
+                progress = (step + 1) / static_cast<float>(kNavigationSteps); // this step is completed
         }
 
         // check for cancel or timeout after the navigation loop
-        if (stop_if_canceled_or_timed_out(goal_handle, result, timeout_deadline, ""))
+        if (stop_if_canceled_or_timed_out(goal_handle, result, timeout_deadline, "",
+                                          start_time, progress, recoveries, current_pose))
             return;
 
         // update the navigation time after the navigation loop
@@ -290,28 +327,85 @@ private:
     // Ends the goal if the coordinator canceled it or its time budget is exhausted.
     // Returns true when the goal is finished, so callers just do: if (stop_if_canceled_or_timed_out(...)) return;
     // `context` is added to the result message to tell where it happened (e.g. "while blocked").
+    // The result also reports what was done so far (times, recoveries, where the robot stopped):
+    // the coordinator needs it to decide a repair (e.g. reassign the subtask from the robot's current position).
     bool stop_if_canceled_or_timed_out(const std::shared_ptr<ExecuteSubtaskGoalHandle> &goal_handle,
                                        const std::shared_ptr<ExecuteSubtask::Result> &result,
                                        const rclcpp::Time &timeout_deadline,
-                                       const std::string &context)
+                                       const std::string &context,
+                                       const rclcpp::Time &start_time,
+                                       float progress,
+                                       int16_t recoveries,
+                                       const geometry_msgs::msg::PoseStamped &current_pose)
     {
+        const bool shutting_down = !rclcpp::ok(); // Ctrl+C on the robot server
+        if (!shutting_down && !goal_handle->is_canceling() && this->now() <= timeout_deadline)
+            return false; // keep going
+
+        // partial result: what the robot had done when it stopped
+        const double elapsed_sec = (this->now() - start_time).seconds();
+        result->success = false;
+        result->execution_time_sec = elapsed_sec;
+        result->navigation_time_sec = elapsed_sec; // the mock only navigates
+        result->distance_remaining = 1.0f - progress; // mock only: distance is proportional to progress
+        result->number_of_recoveries = recoveries;
+        result->final_pose = current_pose;            // where the robot stopped
+
+        if (shutting_down)
+        {
+            // The goal must still reach a final state: a goal handle destroyed while active tries to publish
+            // a result itself, which fails once ROS is shut down and crashes the server.
+            // abort() sets the final state first, then publishes; the publish may fail because communication
+            // is closing, which is expected here, so that error is ignored.
+            result->error_code = ExecuteSubtask::Result::ERROR_HARDWARE_FAULT; // system-level stop, not the subtask's fault
+            result->message = "Robot server shutting down" + context;
+            try
+            {
+                goal_handle->abort(result);
+            }
+            catch (const std::exception &)
+            {
+            }
+            return true;
+        }
+
         if (goal_handle->is_canceling())
         {
-            result->success = false;
+            // cancel is checked first: if both happen at once, the coordinator's explicit request wins
             result->error_code = ExecuteSubtask::Result::ERROR_CANCELED;
             result->message = "goal cancelled by the coordinator" + context;
+            RCLCPP_INFO(this->get_logger(), "Subtask '%s' canceled%s after %.1f s",
+                        goal_handle->get_goal()->subtask_id.c_str(), context.c_str(), elapsed_sec);
             goal_handle->canceled(result);
             return true;
         }
-        if (this->now() > timeout_deadline)
+
+        result->error_code = ExecuteSubtask::Result::ERROR_TIMEOUT;
+        result->message = "Subtask timeout exceeded" + context;
+        RCLCPP_WARN(this->get_logger(), "Subtask '%s' timed out%s after %.1f s",
+                    goal_handle->get_goal()->subtask_id.c_str(), context.c_str(), elapsed_sec);
+        goal_handle->abort(result);
+        return true;
+    }
+
+    // Simulates the time one step takes (kStepDurationSec), but wakes up every kCheckPeriodSec
+    // and returns early if the coordinator asked to cancel or the node is shutting down.
+    // This way a cancel is honoured within kCheckPeriodSec instead of up to one full step.
+    // Uses the steady clock: it measures real elapsed time and never jumps.
+    void wait_step(const std::shared_ptr<ExecuteSubtaskGoalHandle> &goal_handle)
+    {
+        using Clock = std::chrono::steady_clock;
+        const auto step_duration = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kStepDurationSec));
+        const auto check_period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kCheckPeriodSec));
+        const Clock::time_point step_end = Clock::now() + step_duration;
+
+        while (rclcpp::ok() && !goal_handle->is_canceling())
         {
-            result->success = false;
-            result->error_code = ExecuteSubtask::Result::ERROR_TIMEOUT;
-            result->message = "Subtask timeout exceeded" + context;
-            goal_handle->abort(result);
-            return true;
+            const Clock::time_point now = Clock::now();
+            if (now >= step_end)
+                return;
+            std::this_thread::sleep_for(std::min(check_period, step_end - now)); // never sleep past the end of the step
         }
-        return false;
     }
 
     // Builds one feedback message and sends it to the coordinator.
@@ -338,13 +432,21 @@ private:
         feedback->status_message = status_message;
         goal_handle->publish_feedback(feedback);
     }
+    // create action server and store it inside this node class : RobotActionServerNode
+    rclcpp_action::Server<ExecuteSubtask>::SharedPtr robot_action_server_; // it is a smart pointer that will point to a server object created later.
+    rclcpp::CallbackGroup::SharedPtr callback_group_; // group of the action server's callbacks (see constructor)
 };
 
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);                              // Initialize the ROS2 communication system
     auto node = std::make_shared<RobotActionServerNode>(); // Create an instance of the custom node class
-    rclcpp::spin(node);                                    // Run the ROS2 event loop for the node
-    rclcpp::shutdown();                                    // Shut down the ROS2 communication system (stop spinning the nodes)
+
+    // Multi-threaded executor: callbacks of different callback groups can run in parallel
+    // (here the action server's group and the node's default group, e.g. parameter services).
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();    // returns on Ctrl+C
+    rclcpp::shutdown(); // Shut down the ROS2 communication system; the node's destructor then joins the execution thread
     return 0;
 }
