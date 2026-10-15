@@ -15,6 +15,8 @@ public:
     CoordinatorActionClientNode() : Node("coordinator_action_client") // MODIFY NAME
     {
         coordinator_action_client_ = rclcpp_action::create_client<ExecuteSubtask>(this, "execute_subtask");
+        // full action name, for the logs (rclcpp_action::Client has no getter for it in Humble)
+        action_name_ = std::string(this->get_namespace()) == "/" ? "/execute_subtask" : std::string(this->get_namespace()) + "/execute_subtask";
 
         // time_scale: how much faster than real time the experiment runs; must be the same value as the robots'.
         // Durations of the scenario (timeout, cancel time) are given in NOMINAL seconds and divided by
@@ -36,14 +38,75 @@ public:
         this->declare_parameter("cancel_after_sec", 0.0);
 
         RCLCPP_INFO(this->get_logger(), "Time scale %.1f: all times in this node's logs are nominal seconds", time_scale_);
+
+        // Non-blocking server discovery (Phase B, point 1).
+        // Goals are not sent directly: send_goal() queues them, and this timer sends a queued goal as soon as
+        // the robot's action server is available. The coordinator never blocks waiting for a robot, so one
+        // missing or slow-to-start robot cannot freeze it: its other callbacks keep running.
+        // Discovery is not part of the scenario, so it uses a fixed real period (not scaled by time_scale).
+        dispatch_timer_ = this->create_wall_timer(std::chrono::milliseconds(100), [this]() { dispatch_pending_goal(); });
     }
 
-    // timeout_sec is in nominal seconds: it is converted to real seconds with time_scale before being sent
+    // Queues a subtask; it is sent by dispatch_pending_goal() when the robot's action server is available.
+    // timeout_sec is in nominal seconds: it is converted to real seconds with time_scale when the goal is sent.
     void send_goal(std::string mission_id, std::string subtask_id, std::string task_type, geometry_msgs::msg::PoseStamped target_pose, double timeout_sec)
     {
-        // wait for the server
-        coordinator_action_client_->wait_for_action_server();
+        pending_goal_ = PendingGoal{mission_id, subtask_id, task_type, target_pose, timeout_sec};
+        has_pending_goal_ = true;
+        pending_since_ = std::chrono::steady_clock::now();
+        waiting_warned_ = false;
+        RCLCPP_INFO(this->get_logger(), "Subtask %s queued, will be sent when the robot's action server is available", subtask_id.c_str());
+    }
 
+private:
+    // A goal waiting to be sent (only one for now; Phase B point 2 replaces this with per-subtask records).
+    struct PendingGoal
+    {
+        std::string mission_id;
+        std::string subtask_id;
+        std::string task_type;
+        geometry_msgs::msg::PoseStamped target_pose;
+        double timeout_sec; // nominal seconds
+    };
+    PendingGoal pending_goal_;
+    bool has_pending_goal_ = false;
+    std::chrono::steady_clock::time_point pending_since_; // when the goal was queued, to warn if the robot stays unavailable
+    bool waiting_warned_ = false;                          // warn only once per queued goal
+    rclcpp::TimerBase::SharedPtr dispatch_timer_;          // periodic check that sends queued goals (see constructor)
+    static constexpr double kWaitingWarningSec = 2.0;      // real seconds before warning that a robot is not available
+
+    // Called every 100 ms by dispatch_timer_. Sends the queued goal if its robot's action server is available,
+    // otherwise returns immediately (never waits). action_server_is_ready() only checks what ROS has already
+    // discovered, so it does not block.
+    void dispatch_pending_goal()
+    {
+        if (!has_pending_goal_)
+            return; // nothing to send
+
+        if (!coordinator_action_client_->action_server_is_ready())
+        {
+            // robot not available (not started yet, or gone): keep the goal queued and try again at the next tick
+            const double waiting_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - pending_since_).count();
+            if (!waiting_warned_ && waiting_sec >= kWaitingWarningSec)
+            {
+                RCLCPP_WARN(this->get_logger(), "Subtask %s: robot action server '%s' not available after %.1f s (real), still waiting",
+                            pending_goal_.subtask_id.c_str(), action_name_.c_str(), waiting_sec);
+                waiting_warned_ = true;
+            }
+            return;
+        }
+
+        has_pending_goal_ = false; // the goal is sent now: do not send it again at the next tick
+        if (waiting_warned_)
+            RCLCPP_INFO(this->get_logger(), "Subtask %s: robot action server is now available", pending_goal_.subtask_id.c_str());
+        send_goal_now(pending_goal_.mission_id, pending_goal_.subtask_id, pending_goal_.task_type,
+                      pending_goal_.target_pose, pending_goal_.timeout_sec);
+    }
+
+    // Sends the goal to the robot. Only called when its action server is available (see dispatch_pending_goal).
+    void send_goal_now(const std::string &mission_id, const std::string &subtask_id, const std::string &task_type,
+                       const geometry_msgs::msg::PoseStamped &target_pose, double timeout_sec)
+    {
         const double real_timeout_sec = timeout_sec / time_scale_;
 
         // new goal: no deviation reported yet
@@ -57,7 +120,7 @@ public:
         goal.task_type = task_type;
         goal.target_pose = target_pose;
         goal.timeout_sec = real_timeout_sec; // the robot works in real seconds
-        const rclcpp::Time deadline = this->now() + rclcpp::Duration::from_seconds(real_timeout_sec); // Deadline of a subtask. It is the goal's own budget (send time + timeout_sec).  Computed after wait_for_action_server() so that time spent waiting for the server is not counted.
+        const rclcpp::Time deadline = this->now() + rclcpp::Duration::from_seconds(real_timeout_sec); // Deadline of a subtask. It is the goal's own budget (send time + timeout_sec).  Computed when the goal is actually sent, so time spent waiting for the robot's server is not counted.
 
         // add callbacks
         auto options = rclcpp_action::Client<ExecuteSubtask>::SendGoalOptions(); // the options for sending the goal
@@ -84,7 +147,6 @@ public:
         }
     }
 
-private:
     // Fires once, cancel_after_sec after the goal was sent, and asks the robot to cancel the subtask.
     void cancel_timer_callback(const std::string &subtask_id)
     {
@@ -287,6 +349,7 @@ private:
     double nominal(double real_sec) const { return real_sec * time_scale_; }
 
     rclcpp_action::Client<ExecuteSubtask>::SharedPtr coordinator_action_client_;
+    std::string action_name_; // full name of the robot's action (e.g. /robot1/execute_subtask), for the logs
     rclcpp::TimerBase::SharedPtr cancel_timer_;      // one-shot timer for the optional test cancel
     ExecuteSubtaskGoalHandle::SharedPtr goal_handle_; // handle of the accepted goal, needed to cancel it; empty when no goal is active
     double time_scale_ = 1.0;                         // value of the time_scale parameter, read once at start-up
