@@ -26,8 +26,17 @@ public:
         // Later, the Nova Carter server will put its Nav2 action client in a second group.
         callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
+        // Timing parameters. Durations are given in NOMINAL seconds (the time scale of the scenario);
+        // the robot divides them by time_scale to get the real time it waits.
+        // step_duration_sec: nominal time of one navigation step = this robot's speed (robots can differ).
+        // time_scale: how much faster than real time the whole experiment runs (same value for every node);
+        //             1.0 = real time, 10.0 = ten times faster. All times the robot reports are real seconds.
+        // The ranges are enforced by ROS: a value outside them is refused at start-up and by `ros2 param set`.
+        this->declare_parameter("step_duration_sec", 1.0, positive_range_descriptor("nominal duration of one navigation step (s)", 0.01, 60.0));
+        this->declare_parameter("time_scale", 1.0, positive_range_descriptor("speed-up factor of the experiment (1 = real time)", 0.1, 1000.0));
+
         // parameters to simulate a deviation (default: no deviation)
-        this->declare_parameter("simulated_delay_sec", 0.0); // simulated_delay_sec: how long the robot stays blocked during navigation, 0 = never blocked
+        this->declare_parameter("simulated_delay_sec", 0.0); // simulated_delay_sec: how long (nominal s) the robot stays blocked during navigation, 0 = never blocked
         this->declare_parameter("delay_at_step", 2);         // delay_at_step: navigation step at which the robot gets blocked (0 to kNavigationSteps - 1)
 
         // create the action server here
@@ -61,11 +70,28 @@ private:
     std::set<std::string> completed_subtasks_; // keys "mission_id/subtask_id": subtask_id is only unique inside its mission, so subtask1 of mission1 and subtask1 of mission2 are different subtasks.
     std::thread execution_thread_;             // thread running execute_goal for the current subtask
 
-    // constants for the simulated navigation duration
+    // number of steps of the simulated navigation; the duration of a step comes from the parameters
     static constexpr int kNavigationSteps = 5;
-    static constexpr double kStepDurationSec = 1.0;
-    // how often cancel requests are checked while the robot waits: a cancel is honoured within this time
-    static constexpr double kCheckPeriodSec = 0.1;
+    // longest time between two cancel checks while the robot waits: a cancel is honoured within this time
+    // (shorter when steps are short, see wait_step)
+    static constexpr double kMaxCheckPeriodSec = 0.1;
+
+    // Parameter descriptor with an allowed range [min, max], so invalid values (e.g. 0 or negative) are refused.
+    static rcl_interfaces::msg::ParameterDescriptor positive_range_descriptor(const std::string &description, double min, double max)
+    {
+        rcl_interfaces::msg::ParameterDescriptor descriptor;
+        descriptor.description = description;
+        rcl_interfaces::msg::FloatingPointRange range;
+        range.from_value = min;
+        range.to_value = max;
+        descriptor.floating_point_range.push_back(range);
+        return descriptor;
+    }
+
+    double time_scale() const { return this->get_parameter("time_scale").as_double(); }
+
+    // real duration (s) of one navigation step for this robot: its nominal step duration divided by the time scale
+    double real_step_sec() const { return this->get_parameter("step_duration_sec").as_double() / time_scale(); }
 
     // called when the coordinator sends a goal: decide whether this robot takes the subtask
     rclcpp_action::GoalResponse goal_callback(
@@ -113,7 +139,8 @@ private:
         }
 
         // 5. time budget must be long enough for this robot to finish
-        const double expected_duration_sec = kNavigationSteps * kStepDurationSec;
+        //    (real seconds, like timeout_sec: depends on this robot's speed and on the time scale)
+        const double expected_duration_sec = kNavigationSteps * real_step_sec();
         if (goal->timeout_sec <= expected_duration_sec)
         {
             RCLCPP_WARN(this->get_logger(), "Rejecting subtask '%s': timeout_sec %.1f s is too short, needs more than %.1f s",
@@ -199,19 +226,22 @@ private:
         const std::string task_type = goal->task_type;
         const auto target_pose = goal->target_pose;
         const auto start_time = this->get_clock()->now();
-        // read the deviation parameters for this goal; they are read at every goal, so they can be changed
-        // between goals with: ros2 param set /robot_action_server simulated_delay_sec <seconds>
-        const double delay_sec = this->get_parameter("simulated_delay_sec").as_double();
+        // Read the timing and deviation parameters once for this goal, so they stay consistent while it runs.
+        // They are read at every goal, so they can be changed between goals with, for example:
+        //   ros2 param set /robot_action_server simulated_delay_sec <nominal seconds>
+        // Nominal durations are converted to real seconds here (divided by time_scale).
+        const double step_sec = real_step_sec();
+        const double delay_sec = this->get_parameter("simulated_delay_sec").as_double() / time_scale();
         const int delay_at_step = static_cast<int>(this->get_parameter("delay_at_step").as_int());
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Executing subtask '%s' of mission '%s' on robot '%s'",
-            subtask_id.c_str(), mission_id.c_str(), this->get_name());
+            "Executing subtask '%s' of mission '%s' on robot '%s' (step %.3f s real, time scale %.1f)",
+            subtask_id.c_str(), mission_id.c_str(), this->get_name(), step_sec, time_scale());
 
         if (delay_sec > 0.0)
         {
-            RCLCPP_WARN(this->get_logger(), "Simulated deviation: subtask '%s' will be blocked for %.1f s at step %d",
+            RCLCPP_WARN(this->get_logger(), "Simulated deviation: subtask '%s' will be blocked for %.2f s (real) at step %d",
                         subtask_id.c_str(), delay_sec, delay_at_step);
         }
 
@@ -259,10 +289,10 @@ private:
                     const double blocked_sec = (this->now() - blocked_start).seconds();
 
                     publish_feedback(goal_handle, ExecuteSubtask::Feedback::STATE_BLOCKED, progress,
-                                     (kNavigationSteps - step) * kStepDurationSec + blocked_sec,
+                                     (kNavigationSteps - step) * step_sec + blocked_sec,
                                      recoveries, start_time, current_pose, "Robot is blocked");
 
-                    wait_step(goal_handle);
+                    wait_step(goal_handle, step_sec);
                 }
                 RCLCPP_INFO(this->get_logger(), "Subtask '%s' is no longer blocked, resuming navigation", subtask_id.c_str());
             }
@@ -275,11 +305,11 @@ private:
             // feedback is published at the start of each step, so it describes the work already done
             progress = step / static_cast<float>(kNavigationSteps); // fraction already done
             publish_feedback(goal_handle, ExecuteSubtask::Feedback::STATE_NAVIGATING, progress,
-                             (kNavigationSteps - step) * kStepDurationSec,
+                             (kNavigationSteps - step) * step_sec,
                              recoveries, start_time, current_pose, "Navigating to target pose");
 
-            // wait kStepDurationSec to simulate the time the step takes (returns early on a cancel request)
-            wait_step(goal_handle);
+            // wait one step to simulate the time the step takes (returns early on a cancel request)
+            wait_step(goal_handle, step_sec);
             if (!goal_handle->is_canceling())
                 progress = (step + 1) / static_cast<float>(kNavigationSteps); // this step is completed
         }
@@ -388,15 +418,17 @@ private:
         return true;
     }
 
-    // Simulates the time one step takes (kStepDurationSec), but wakes up every kCheckPeriodSec
+    // Simulates the time one step takes (step_sec, real seconds), but wakes up regularly
     // and returns early if the coordinator asked to cancel or the node is shutting down.
-    // This way a cancel is honoured within kCheckPeriodSec instead of up to one full step.
+    // The check period is kMaxCheckPeriodSec, or a tenth of the step if steps are shorter
+    // (fast time scale), so a cancel is always honoured well within one step.
     // Uses the steady clock: it measures real elapsed time and never jumps.
-    void wait_step(const std::shared_ptr<ExecuteSubtaskGoalHandle> &goal_handle)
+    void wait_step(const std::shared_ptr<ExecuteSubtaskGoalHandle> &goal_handle, double step_sec)
     {
         using Clock = std::chrono::steady_clock;
-        const auto step_duration = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kStepDurationSec));
-        const auto check_period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(kCheckPeriodSec));
+        const double check_sec = std::min(kMaxCheckPeriodSec, step_sec / 10.0);
+        const auto step_duration = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(step_sec));
+        const auto check_period = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(check_sec));
         const Clock::time_point step_end = Clock::now() + step_duration;
 
         while (rclcpp::ok() && !goal_handle->is_canceling())

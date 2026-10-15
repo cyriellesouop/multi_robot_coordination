@@ -16,15 +16,39 @@ public:
     {
         coordinator_action_client_ = rclcpp_action::create_client<ExecuteSubtask>(this, "execute_subtask");
 
-        // cancel_after_sec: send a cancel request this many seconds after the goal is sent (0 = never).
+        // time_scale: how much faster than real time the experiment runs; must be the same value as the robots'.
+        // Durations of the scenario (timeout, cancel time) are given in NOMINAL seconds and divided by
+        // time_scale before use, so the scenario does not change when the experiment is sped up.
+        // The robots' feedback and results are in real seconds; this node converts them back to nominal
+        // seconds for its logs, so a run prints the same numbers at any time scale.
+        // Decisions (e.g. margin < 0) are made on real values; only the printing is nominal.
+        rcl_interfaces::msg::ParameterDescriptor time_scale_descriptor;
+        time_scale_descriptor.description = "speed-up factor of the experiment (1 = real time)";
+        rcl_interfaces::msg::FloatingPointRange range;
+        range.from_value = 0.1;
+        range.to_value = 1000.0;
+        time_scale_descriptor.floating_point_range.push_back(range);
+        this->declare_parameter("time_scale", 1.0, time_scale_descriptor);
+        time_scale_ = this->get_parameter("time_scale").as_double(); // fixed for the whole run
+
+        // cancel_after_sec: send a cancel request this many nominal seconds after the goal is sent (0 = never).
         // Used to test cancellation; later the coordinator's own logic (e.g. a repair) will decide when to cancel.
         this->declare_parameter("cancel_after_sec", 0.0);
+
+        RCLCPP_INFO(this->get_logger(), "Time scale %.1f: all times in this node's logs are nominal seconds", time_scale_);
     }
 
+    // timeout_sec is in nominal seconds: it is converted to real seconds with time_scale before being sent
     void send_goal(std::string mission_id, std::string subtask_id, std::string task_type, geometry_msgs::msg::PoseStamped target_pose, double timeout_sec)
     {
         // wait for the server
         coordinator_action_client_->wait_for_action_server();
+
+        const double real_timeout_sec = timeout_sec / time_scale_;
+
+        // new goal: no deviation reported yet
+        blocked_ = false;
+        at_risk_ = false;
 
         // create a goal
         auto goal = ExecuteSubtask::Goal();
@@ -32,8 +56,8 @@ public:
         goal.subtask_id = subtask_id;
         goal.task_type = task_type;
         goal.target_pose = target_pose;
-        goal.timeout_sec = timeout_sec;
-        const rclcpp::Time deadline = this->now() + rclcpp::Duration::from_seconds(timeout_sec); // Deadline of a subtask. It is the goal's own budget (send time + timeout_sec).  Computed after wait_for_action_server() so that time spent waiting for the server is not counted.
+        goal.timeout_sec = real_timeout_sec; // the robot works in real seconds
+        const rclcpp::Time deadline = this->now() + rclcpp::Duration::from_seconds(real_timeout_sec); // Deadline of a subtask. It is the goal's own budget (send time + timeout_sec).  Computed after wait_for_action_server() so that time spent waiting for the server is not counted.
 
         // add callbacks
         auto options = rclcpp_action::Client<ExecuteSubtask>::SendGoalOptions(); // the options for sending the goal
@@ -43,14 +67,16 @@ public:
         options.feedback_callback = std::bind(&CoordinatorActionClientNode::goal_feedback_callback, this, _1, _2, subtask_id, deadline); // // Called each time the robot publishes feedback (_1 = goal handle, _2 = feedback message).
 
         // send the goal
-        RCLCPP_INFO(this->get_logger(), "Sending goal with mission_id: %s, subtask_id: %s, task_type: %s", goal.mission_id.c_str(), goal.subtask_id.c_str(), goal.task_type.c_str());
+        RCLCPP_INFO(this->get_logger(), "Sending goal with mission_id: %s, subtask_id: %s, task_type: %s, timeout %.1f s (%.2f s real)",
+                    goal.mission_id.c_str(), goal.subtask_id.c_str(), goal.task_type.c_str(), timeout_sec, real_timeout_sec);
         coordinator_action_client_->async_send_goal(goal, options); // send the goal asynchronously
 
-        // optional test cancel: a one-shot timer that sends a cancel request cancel_after_sec after sending the goal
-        const double cancel_after_sec = this->get_parameter("cancel_after_sec").as_double();
+        // optional test cancel: a one-shot timer that sends a cancel request cancel_after_sec (nominal) after sending the goal
+        const double cancel_after_nominal_sec = this->get_parameter("cancel_after_sec").as_double();
+        const double cancel_after_sec = cancel_after_nominal_sec / time_scale_; // real seconds, for the timer
         if (cancel_after_sec > 0.0)
         {
-            RCLCPP_INFO(this->get_logger(), "Subtask %s will be canceled in %.1f s (cancel_after_sec)", subtask_id.c_str(), cancel_after_sec);
+            RCLCPP_INFO(this->get_logger(), "Subtask %s will be canceled after %.1f s (cancel_after_sec)", subtask_id.c_str(), cancel_after_nominal_sec);
             cancel_timer_ = this->create_wall_timer(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(cancel_after_sec)),
                 // a lambda, not std::bind: create_wall_timer needs to see that the callback takes no argument
@@ -159,30 +185,49 @@ private:
         //    The coordinator knows the deadline; only the robot knows how long it still needs
         //    (estimated_time_remaining_sec is the time to completion, not the time before the timeout).
         //    A negative margin means the subtask will finish late, even if the robot's timeout has not fired yet.
+        //    Computed on real seconds (the robot's estimate and the deadline are real); converted to nominal only for printing.
         const double time_left_sec = (deadline - this->now()).seconds();
         const double margin_sec = time_left_sec - feedback->estimated_time_remaining_sec;
+        const double needs_nominal = nominal(feedback->estimated_time_remaining_sec);
+        const double left_nominal = nominal(time_left_sec);
+        const double margin_nominal = nominal(margin_sec);
 
-        RCLCPP_INFO(this->get_logger(),
-                    "Subtask %s on %s [%s]: progress=%.0f%%, needs %.1f s, %.1f s left before deadline, margin=%.1f s, recoveries=%d, '%s'",
-                    subtask_id.c_str(), feedback->robot_name.c_str(), state.c_str(),
-                    feedback->progress * 100.0, feedback->estimated_time_remaining_sec, time_left_sec, margin_sec,
-                    feedback->number_of_recoveries, feedback->status_message.c_str());
+        // Routine progress at DEBUG level: one line per feedback is too much at a high time scale.
+        // Show it with: --ros-args --log-level coordinator_action_client:=debug (or record it with rosbag).
+        RCLCPP_DEBUG(this->get_logger(),
+                     "Subtask %s on %s [%s]: progress=%.0f%%, needs %.1f s, %.1f s left before deadline, margin=%.1f s, recoveries=%d, '%s'",
+                     subtask_id.c_str(), feedback->robot_name.c_str(), state.c_str(),
+                     feedback->progress * 100.0, needs_nominal, left_nominal, margin_nominal,
+                     feedback->number_of_recoveries, feedback->status_message.c_str());
 
-        // 3. Deviation signals.
-        //    BLOCKED is reported separately: a blocked robot is a deviation even while the margin is still positive.
-        if (feedback->state == ExecuteSubtask::Feedback::STATE_BLOCKED)
+        // 3. Deviation signals, reported when they START and when they END (state transitions),
+        //    not on every feedback. Later, the transition to "at risk" is where the coordinator will run
+        //    the impact analysis on the dependent subtasks and choose a repair.
+
+        //    BLOCKED is tracked separately: a blocked robot is a deviation even while the margin is still positive.
+        const bool blocked_now = (feedback->state == ExecuteSubtask::Feedback::STATE_BLOCKED);
+        if (blocked_now != blocked_)
         {
-            RCLCPP_WARN(this->get_logger(), "Subtask %s: robot %s reports it is BLOCKED",
-                        subtask_id.c_str(), feedback->robot_name.c_str());
+            if (blocked_now)
+                RCLCPP_WARN(this->get_logger(), "Subtask %s: robot %s is BLOCKED (margin %.1f s, recoveries %d)",
+                            subtask_id.c_str(), feedback->robot_name.c_str(), margin_nominal, feedback->number_of_recoveries);
+            else
+                RCLCPP_INFO(this->get_logger(), "Subtask %s: robot %s is no longer blocked (margin %.1f s)",
+                            subtask_id.c_str(), feedback->robot_name.c_str(), margin_nominal);
+            blocked_ = blocked_now;
         }
 
-        //    Negative margin: the subtask is at risk. Later, this is where the coordinator will run
-        //    the impact analysis on the dependent subtasks and choose a repair.
-        if (margin_sec < 0.0)
+        //    Negative margin: the subtask will finish after its deadline unless something changes.
+        const bool at_risk_now = (margin_sec < 0.0);
+        if (at_risk_now != at_risk_)
         {
-            RCLCPP_WARN(this->get_logger(),
-                        "Subtask %s AT RISK: needs %.1f s but only %.1f s left before the deadline (%.1f s late)",
-                        subtask_id.c_str(), feedback->estimated_time_remaining_sec, time_left_sec, -margin_sec);
+            if (at_risk_now)
+                RCLCPP_WARN(this->get_logger(),
+                            "Subtask %s AT RISK: needs %.1f s but only %.1f s left before the deadline (%.1f s late)",
+                            subtask_id.c_str(), needs_nominal, left_nominal, -margin_nominal);
+            else
+                RCLCPP_INFO(this->get_logger(), "Subtask %s is back on time (margin %.1f s)", subtask_id.c_str(), margin_nominal);
+            at_risk_ = at_risk_now;
         }
     }
 
@@ -228,7 +273,7 @@ private:
 
         RCLCPP_INFO(this->get_logger(),
                     "  execution_time=%.2f s, navigation_time=%.2f s, distance_remaining=%.2f m, recoveries=%d",
-                    execution_time, navigation_time, distance_remaining, recoveries);
+                    nominal(execution_time), nominal(navigation_time), distance_remaining, recoveries);
 
         RCLCPP_INFO(this->get_logger(),
                     "  final_pose: frame='%s', x=%.2f, y=%.2f, z=%.2f",
@@ -238,9 +283,18 @@ private:
         rclcpp::shutdown();
     }
 
+    // converts a real duration (as measured or reported by the robots) to nominal seconds, for the logs
+    double nominal(double real_sec) const { return real_sec * time_scale_; }
+
     rclcpp_action::Client<ExecuteSubtask>::SharedPtr coordinator_action_client_;
     rclcpp::TimerBase::SharedPtr cancel_timer_;      // one-shot timer for the optional test cancel
     ExecuteSubtaskGoalHandle::SharedPtr goal_handle_; // handle of the accepted goal, needed to cancel it; empty when no goal is active
+    double time_scale_ = 1.0;                         // value of the time_scale parameter, read once at start-up
+
+    // Last deviation state reported for the current goal, so a deviation is logged when it starts and ends,
+    // not on every feedback. One goal at a time for now; with several goals this becomes a map per subtask.
+    bool blocked_ = false; // robot reported BLOCKED
+    bool at_risk_ = false; // margin < 0
 };
 
 int main(int argc, char **argv)
