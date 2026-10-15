@@ -170,6 +170,10 @@ src/
 └── actions/
     ├── CMakeLists.txt
     ├── package.xml
+    ├── config/
+    │   └── mock_fleet.yaml
+    ├── launch/
+    │   └── mock_fleet.launch.py
     └── src/
         ├── robot_action_server.cpp
         └── coordinator_action_client.cpp
@@ -215,8 +219,10 @@ Run `ros2 interface show multi_robot_interfaces/action/ExecuteSubtask` to see th
 |---|---|
 | `src/robot_action_server.cpp` | **Mock robot.** Action server `robot_action_server` on `execute_subtask`. Rejects a goal if `mission_id` or `subtask_id` is empty, if the task type is not `navigate` (the only task implemented so far), if `timeout_sec` is not greater than the 5 s it needs, if the same subtask already succeeded, or if it is busy with another subtask. Executes accepted goals in a separate thread: simulates navigation in 5 steps while publishing feedback (progress and estimated time to completion), and checks for cancellation and timeout at least every 0.1 s and once more after the last step. Parameters: `robot_name` (how the robot identifies itself in its feedback and logs; by default its namespace, e.g. `robot1` for `/robot1`; read-only), `step_duration_sec` (nominal duration of a step, default 1.0: the robot's speed, so robots can differ) and `time_scale` (speed-up of the whole experiment, default 1.0); the 5 s it needs, `simulated_delay_sec` and `timeout_sec` checks all follow them. A canceled or timed-out goal returns a partial result (times, recoveries, remaining distance, last pose). It uses a multi-threaded executor, and the thread running the goal is joined on shutdown (Ctrl+C aborts an active goal cleanly). Successful subtasks are remembered; failed or canceled ones can be retried. It can simulate a deviation: with the parameter `simulated_delay_sec` greater than 0, the robot gets blocked for that many nominal seconds at step `delay_at_step` (default 2), publishes `BLOCKED` feedback with a growing time estimate and one recovery, and still honours cancellation and timeout. See [TESTING.md](TESTING.md) for manual tests. |
 | `src/coordinator_action_client.cpp` | **Coordinator.** Action client node `coordinator_action_client`. Waits for the `execute_subtask` server, sends one hard-coded `navigate` goal (mission `mission1`, subtask `subtask1`, timeout 30 s), logs whether the goal was accepted or rejected, then the final status and result fields, and shuts down (also when the goal is rejected). It computes, from each feedback message, the margin between the time left before the deadline and the time the robot still needs, and reports a deviation when it starts and when it ends (robot `BLOCKED`, margin negative = subtask at risk), not on every message; the per-feedback progress line is at debug level. With the parameter `time_scale` (same value as the robots') the scenario is given in nominal seconds and all times in its logs are nominal, so a run prints the same numbers at any speed. The deadline is currently the goal's own `timeout_sec`; it will come from the workflow model. With the parameter `cancel_after_sec` greater than 0 it sends a cancel request that many seconds after the goal and logs the robot's answer (accepted, rejected, unknown or already finished) and the `CANCELED` result; the default is 0, no cancel. It uses a single-threaded executor and never blocks in a callback. It does not repair the workflow yet. |
-| `CMakeLists.txt` | Builds and installs the `robot_action_server` and `coordinator_action_client` executables. |
-| `package.xml` | Package manifest: depends on `rclcpp`, `rclcpp_action`, `multi_robot_interfaces`, `geometry_msgs` and `diagnostic_msgs`. |
+| `launch/mock_fleet.launch.py` | Starts one `robot_action_server` per robot of the fleet file, each in its own namespace (`/<name>`), with the same `time_scale`. Launch arguments: `time_scale` (default 1.0) and `fleet_config` (YAML file, default `config/mock_fleet.yaml`). It stops with an error if the file has no robots, a robot without a name, or a name used twice. |
+| `config/mock_fleet.yaml` | The mock fleet: one entry per robot with its `name` (namespace) and optionally `step_duration_sec` (speed), `simulated_delay_sec` and `delay_at_step`. Three robots with different speeds by default. All durations are nominal seconds. |
+| `CMakeLists.txt` | Builds and installs the `robot_action_server` and `coordinator_action_client` executables, and installs the `launch/` and `config/` folders. |
+| `package.xml` | Package manifest: depends on `rclcpp`, `rclcpp_action`, `multi_robot_interfaces`, `geometry_msgs` and `diagnostic_msgs`; the launch file also needs `launch`, `launch_ros` and `python3-yaml`. |
 
 ## Build
 
@@ -272,7 +278,13 @@ ros2 run actions robot_action_server --ros-args -p time_scale:=10.0
 ros2 run actions coordinator_action_client --ros-args -p time_scale:=10.0
 ```
 
-To run several robots side by side, start each one in its own namespace: the action then becomes `/robot2/execute_subtask` and the robot reports itself as `robot2` (or as the name given with `-p robot_name:=...`). The client must currently be started in the same namespace to find it:
+To start the whole mock fleet with one command (three robots with different speeds, defined in `config/mock_fleet.yaml`), optionally faster than real time:
+
+```bash
+ros2 launch actions mock_fleet.launch.py time_scale:=10.0
+```
+
+Each robot is then at `/robot1/execute_subtask`, `/robot2/execute_subtask` and `/robot3/execute_subtask`; edit the YAML file (or pass `fleet_config:=<file>`) to change the robots. To start a single robot by hand instead, start it in its own namespace: the action then becomes `/robot2/execute_subtask` and the robot reports itself as `robot2` (or as the name given with `-p robot_name:=...`). The client must currently be started in the same namespace to find it:
 
 ```bash
 ros2 run actions robot_action_server --ros-args -r __ns:=/robot2
@@ -303,6 +315,10 @@ See [TESTING.md](TESTING.md) for the complete list of manual tests.
 - [ ] Nova Carter robot server (Nav2)
 
 ## Changelog
+
+### 2026-10-15 - Add a launch file to start a fleet of mock robots
+- `ros2 launch actions mock_fleet.launch.py` starts one mock robot per entry of `config/mock_fleet.yaml`, each in its own namespace with its own speed and a shared `time_scale`, so a heterogeneous fleet starts with one command.
+- Build with `colcon build --packages-select actions`, then run `ros2 launch actions mock_fleet.launch.py time_scale:=10.0`; the `robot_name` parameter now shows the real name.
 
 ### 2026-10-15 - Identify each robot by a name
 - The mock robot has a read-only `robot_name` parameter (default: its namespace) used in its feedback and logs, so the coordinator can tell robots apart; started in a namespace, its action is `/<namespace>/execute_subtask`.

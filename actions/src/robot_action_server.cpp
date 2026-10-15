@@ -40,14 +40,16 @@ public:
         this->declare_parameter("delay_at_step", 2);         // delay_at_step: navigation step at which the robot gets blocked (0 to kNavigationSteps - 1)
 
         // robot_name: how this robot identifies itself in its feedback and logs, so the coordinator can tell
-        // robots apart. Default (empty): the namespace the robot was started in (e.g. "robot1" for /robot1),
-        // or the node name if there is no namespace. Read-only: a robot keeps the same name for its whole run.
+        // robots apart. Default: the namespace the robot was started in (e.g. "robot1" for /robot1),
+        // or the node name if there is no namespace. A value given with -p robot_name:=... replaces the default.
+        // The default is computed BEFORE declaring the parameter, so the parameter holds the real name and
+        // `ros2 param get <node> robot_name` shows it. Read-only: a robot keeps the same name for its whole run.
         rcl_interfaces::msg::ParameterDescriptor name_descriptor;
         name_descriptor.description = "name of this robot in feedback and logs (default: its namespace)";
         name_descriptor.read_only = true;
-        robot_name_ = this->declare_parameter("robot_name", std::string(""), name_descriptor);
+        robot_name_ = this->declare_parameter("robot_name", default_robot_name(), name_descriptor);
         if (robot_name_.empty())
-            robot_name_ = default_robot_name();
+            robot_name_ = default_robot_name(); // -p robot_name:="" given explicitly: fall back to the default
 
         // create the action server here.
         // "execute_subtask" is a relative name: started in namespace /robot1, the server is /robot1/execute_subtask,

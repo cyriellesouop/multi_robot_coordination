@@ -25,4 +25,12 @@ coordinator_action_client
 DESTINATION lib/${PROJECT_NAME}/
 ) # After building, copy the executable robot_action_server into the install directory so ROS 2 can find and run it
 
+# Install the launch files and the fleet configuration into share/actions/,
+# where `ros2 launch actions ...` and get_package_share_directory("actions") look for them.
+install(DIRECTORY
+  launch
+  config
+  DESTINATION share/${PROJECT_NAME}
+)
+
 ament_package()

@@ -1,0 +1,24 @@
+# Mock robot fleet started by launch/mock_fleet.launch.py.
+#
+# One entry per robot. Each robot runs its own robot_action_server node in the namespace `name`,
+# so its action is /<name>/execute_subtask and it reports itself as <name> in its feedback.
+#
+# Durations are NOMINAL seconds. The launch argument `time_scale` (same for every robot) makes the
+# whole fleet run faster than real time without changing these values.
+#
+# Fields:
+#   name                 required. Namespace of the robot (letters, digits, '_'; must not start with a digit).
+#   step_duration_sec    optional, default 1.0. Nominal duration of one navigation step = the robot's speed.
+#                        A subtask takes 5 steps, so 1.0 -> 5 s, 2.0 -> 10 s. Robots may differ (heterogeneous fleet).
+#   simulated_delay_sec  optional, default 0.0. Blocks the robot for this long during each subtask (0 = never).
+#   delay_at_step        optional, default 2. Navigation step (0 to 4) at which the robot gets blocked.
+
+robots:
+  - name: robot1
+    step_duration_sec: 1.0   # reference speed: 5 s per subtask
+
+  - name: robot2
+    step_duration_sec: 1.5   # slower robot: 7.5 s per subtask
+
+  - name: robot3
+    step_duration_sec: 0.8   # faster robot: 4 s per subtask
