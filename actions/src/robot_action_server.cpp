@@ -39,7 +39,19 @@ public:
         this->declare_parameter("simulated_delay_sec", 0.0); // simulated_delay_sec: how long (nominal s) the robot stays blocked during navigation, 0 = never blocked
         this->declare_parameter("delay_at_step", 2);         // delay_at_step: navigation step at which the robot gets blocked (0 to kNavigationSteps - 1)
 
-        // create the action server here
+        // robot_name: how this robot identifies itself in its feedback and logs, so the coordinator can tell
+        // robots apart. Default (empty): the namespace the robot was started in (e.g. "robot1" for /robot1),
+        // or the node name if there is no namespace. Read-only: a robot keeps the same name for its whole run.
+        rcl_interfaces::msg::ParameterDescriptor name_descriptor;
+        name_descriptor.description = "name of this robot in feedback and logs (default: its namespace)";
+        name_descriptor.read_only = true;
+        robot_name_ = this->declare_parameter("robot_name", std::string(""), name_descriptor);
+        if (robot_name_.empty())
+            robot_name_ = default_robot_name();
+
+        // create the action server here.
+        // "execute_subtask" is a relative name: started in namespace /robot1, the server is /robot1/execute_subtask,
+        // so several robots can run side by side without changing this code.
         robot_action_server_ = rclcpp_action::create_server<ExecuteSubtask>(
             this,
             "execute_subtask", // the name of the server such that the client can reach it
@@ -50,7 +62,8 @@ public:
             rcl_action_server_get_default_options(), 
             callback_group_
         );
-        RCLCPP_INFO(this->get_logger(), "Action server has been started");
+        RCLCPP_INFO(this->get_logger(), "Robot '%s': action server started on %s/execute_subtask",
+                    robot_name_.c_str(), std::string(this->get_namespace()) == "/" ? "" : this->get_namespace());
     }
 
     // Wait for the execution thread before the node is destroyed: the thread uses the node (this),
@@ -86,6 +99,16 @@ private:
         range.to_value = max;
         descriptor.floating_point_range.push_back(range);
         return descriptor;
+    }
+
+    std::string robot_name_; // value of the robot_name parameter (see constructor)
+
+    // Default robot name: the namespace without its leading '/' (e.g. "/robot1" -> "robot1"),
+    // or the node name when the node runs without a namespace ("/").
+    std::string default_robot_name() const
+    {
+        const std::string ns = this->get_namespace();
+        return (ns == "/" || ns.empty()) ? std::string(this->get_name()) : ns.substr(1);
     }
 
     double time_scale() const { return this->get_parameter("time_scale").as_double(); }
@@ -237,7 +260,7 @@ private:
         RCLCPP_INFO(
             this->get_logger(),
             "Executing subtask '%s' of mission '%s' on robot '%s' (step %.3f s real, time scale %.1f)",
-            subtask_id.c_str(), mission_id.c_str(), this->get_name(), step_sec, time_scale());
+            subtask_id.c_str(), mission_id.c_str(), robot_name_.c_str(), step_sec, time_scale());
 
         if (delay_sec > 0.0)
         {
@@ -453,7 +476,7 @@ private:
                           const std::string &status_message)
     {
         auto feedback = std::make_shared<ExecuteSubtask::Feedback>();
-        feedback->robot_name = this->get_name();
+        feedback->robot_name = robot_name_; // identifies this robot to the coordinator
         feedback->state = state;
         feedback->progress = progress;
         feedback->current_pose = current_pose;
