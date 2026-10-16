@@ -118,9 +118,14 @@ choose between robots during allocation and repair, the coordinator will need ea
 
 ### Time source
 
-All durations are measured with the node clock (`this->now()`). On a real robot this is the system time.
-In simulation (Isaac Sim or Gazebo with `use_sim_time:=true`), the clock follows the simulator's `/clock`
-topic, so the same code works in both cases.
+The mock robots and the coordinator run on **system (wall) time only**. Each mock robot measures deadlines and
+reported durations with the node clock (`this->now()`) but simulates execution by waiting on the steady (wall)
+clock, and the coordinator uses wall timers; these agree only with system time. With `use_sim_time:=true` the
+node clock would follow the `/clock` topic, which can pause or run at another rate, and the two would diverge,
+so both nodes refuse to start with `use_sim_time:=true`. Experiments are sped up with `time_scale` instead.
+
+The Nova Carter robot server will run on ROS time with Nav2 (for example in Isaac Sim with `use_sim_time:=true`);
+its execution follows Nav2 rather than a simulated wait, so the question will be handled there.
 
 ## Recording and replaying executions with rosbag
 
@@ -306,6 +311,10 @@ See [TESTING.md](TESTING.md) for the complete list of manual tests.
 - [ ] Nova Carter robot server (Nav2)
 
 ## Changelog
+
+### 2026-10-15 - Run the mock robots and the coordinator on system time only
+- Both nodes refuse to start with `use_sim_time:=true`: they mix the node clock with wall-clock waits and timers, which agree only with system time; experiments are sped up with `time_scale` instead. The README's "Time source" section now states this choice.
+- Check with `ros2 run actions robot_action_server --ros-args -p use_sim_time:=true` (refused); build with `colcon build --packages-select actions`.
 
 ### 2026-10-15 - Cancel a single subtask and reassign it to another robot
 - The coordinator cancels one subtask without affecting the others (`cancel_subtask`) and can reassign it to another robot as a new attempt (`reassign_to`); callbacks carry the subtask, the attempt and the robot, and answers from an old attempt are ignored (fifth and last of the Phase B coordinator changes).

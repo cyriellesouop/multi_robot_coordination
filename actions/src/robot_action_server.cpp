@@ -6,6 +6,7 @@
 #include <chrono>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
@@ -25,6 +26,16 @@ public:
         // keeps other callbacks (e.g. parameter services) responsive.
         // Later, the Nova Carter server will put its Nav2 action client in a second group.
         callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+        // Time source: the mock robot runs on SYSTEM (wall) time only.
+        // It measures deadlines and reported durations with the node clock (this->now()) but waits with the steady
+        // (wall) clock (see wait_step). Both agree only with system time: with use_sim_time, the node clock follows
+        // the /clock topic, which may pause or run at another rate, and the two would diverge. The speed-up of an
+        // experiment comes from time_scale instead, so simulation time is not needed for the mock robots.
+        // Refuse it explicitly rather than run with inconsistent timing.
+        if (this->get_parameter("use_sim_time").as_bool())
+            throw std::runtime_error("robot_action_server (mock) does not support use_sim_time:=true; "
+                                     "it runs on system time, use time_scale to speed up experiments");
 
         // Timing parameters. Durations are given in NOMINAL seconds (the time scale of the scenario);
         // the robot divides them by time_scale to get the real time it waits.

@@ -95,6 +95,14 @@ class CoordinatorActionClientNode : public rclcpp::Node // MODIFY NAME
 public:
     CoordinatorActionClientNode() : Node("coordinator_action_client") // MODIFY NAME
     {
+        // Time source: the coordinator runs on SYSTEM (wall) time only, like the mock robots.
+        // Its deadlines use the node clock (this->now()) while its timers are wall timers (create_wall_timer);
+        // both agree only with system time. With use_sim_time the node clock would follow /clock and could diverge
+        // from the timers and from the robots' clocks. The speed-up of an experiment comes from time_scale instead.
+        if (this->get_parameter("use_sim_time").as_bool())
+            throw std::runtime_error("coordinator_action_client does not support use_sim_time:=true; "
+                                     "it runs on system time, use time_scale to speed up experiments");
+
         // One action client per robot of the fleet (Phase B, point 4).
         // robots: names of the robots, the same names as the namespaces of mock_fleet.launch.py
         // (robot1 -> action /robot1/execute_subtask). The coordinator itself runs WITHOUT a namespace and
