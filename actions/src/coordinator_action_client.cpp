@@ -128,6 +128,13 @@ public:
         // cancel_after_sec: send a cancel request this many nominal seconds after a subtask is sent (0 = never).
         // Used to test cancellation; later the coordinator's own logic (e.g. a repair) will decide when to cancel.
         this->declare_parameter("cancel_after_sec", 0.0);
+        // cancel_subtask: id of the only subtask the test cancel applies to (e.g. "subtask1"); empty (default) = every subtask.
+        // Cancelling one subtask leaves the others running (Phase B point 5).
+        this->declare_parameter("cancel_subtask", std::string(""));
+        // reassign_to: robot to which the canceled subtask is reassigned right after the cancel request (empty = no
+        // reassignment). A minimal "reassignment" repair, used to test that a late answer from the canceled attempt
+        // is ignored and does not overwrite the new attempt.
+        this->declare_parameter("reassign_to", std::string(""));
 
         // subtask_count: number of subtasks main() queues (subtask1, subtask2, ...), assigned to the robots in turn
         // (subtask1 -> first robot, subtask2 -> second robot, ...; after the last robot it starts again with the first).
@@ -182,6 +189,7 @@ public:
         record.target_pose = target_pose;
         record.timeout_nominal_sec = timeout_sec;
         record.state = SubtaskState::WAITING_FOR_ROBOT;
+        record.attempt = 1; // first attempt; a retry or a reassignment creates attempt 2, 3, ... (see reassign)
         record.waiting_since = std::chrono::steady_clock::now();
         subtasks_[key] = record;
 
@@ -201,17 +209,19 @@ private:
     }
 
     // Returns the record of `key` if `attempt` is still its current attempt, or nullptr otherwise.
-    // Every callback calls this first: a callback from an old attempt (the subtask was resent since) must not
-    // change the record, which now describes the new attempt. `what` names the event, for the log.
-    SubtaskRecord *current_record(const SubtaskKey &key, int attempt, const char *what)
+    // Every callback calls this first: a callback from an old attempt (the subtask was retried or reassigned since)
+    // must not change the record, which now describes the new attempt. `robot` is the robot of the attempt the
+    // callback belongs to and `what` names the event, both for the log.
+    SubtaskRecord *current_record(const SubtaskKey &key, int attempt, const std::string &robot, const char *what)
     {
         auto it = subtasks_.find(key);
         if (it == subtasks_.end())
             return nullptr; // unknown subtask (should not happen)
         if (it->second.attempt != attempt)
         {
-            RCLCPP_INFO(this->get_logger(), "Ignoring %s of %s/%s attempt %d: the current attempt is %d",
-                        what, key.first.c_str(), key.second.c_str(), attempt, it->second.attempt);
+            RCLCPP_INFO(this->get_logger(), "Ignoring %s of %s/%s#%d@%s: the current attempt is #%d@%s",
+                        what, key.first.c_str(), key.second.c_str(), attempt, robot.c_str(),
+                        it->second.attempt, it->second.robot.c_str());
             return nullptr;
         }
         return &it->second;
@@ -253,12 +263,13 @@ private:
         }
     }
 
-    // Sends a new attempt of the subtask to its robot. Only called when the robot's action server is available.
-    // Starts a new attempt: everything about the previous attempt (goal handle, deviation flags, cancel state)
-    // is reset, and the callbacks are bound to the new attempt number.
+    // Sends the current attempt of the subtask to its robot. Only called when the robot's action server is available.
+    // The attempt number was already assigned when the attempt was created (send_goal: 1, reassign: +1), not here:
+    // otherwise a late answer from the previous attempt, arriving while the new attempt waits to be sent, would still
+    // match the old number and be taken for the current attempt. Everything about the previous attempt (goal handle,
+    // deviation flags, cancel state) is reset, and the callbacks are bound to this attempt number and robot.
     void send_attempt(const SubtaskKey &key, SubtaskRecord &record)
     {
-        record.attempt += 1;
         record.state = SubtaskState::GOAL_SENT;
         record.goal_handle.reset();
         record.blocked = false;
@@ -268,6 +279,7 @@ private:
             record.cancel_timer->cancel();
         record.waiting_warned = false;
         const int attempt = record.attempt;
+        const std::string robot = record.robot; // robot of this attempt, carried by its callbacks
 
         const double real_timeout_sec = record.timeout_nominal_sec / time_scale_;
 
@@ -282,26 +294,31 @@ private:
         // actually sent, so time spent waiting for the robot's server is not counted. Later it comes from the workflow.
         record.deadline = this->now() + rclcpp::Duration::from_seconds(real_timeout_sec);
 
-        // Callbacks: each one is bound to (key, attempt), so it can find its record and check that it still
-        // belongs to the current attempt (see current_record). Lambdas capture these values by copy.
+        // Callbacks: each one is bound to (mission, subtask) = key, the attempt number and its robot, so it can find
+        // its record and check that it still belongs to the current attempt (see current_record).
+        // Lambdas capture these values by copy.
         auto options = rclcpp_action::Client<ExecuteSubtask>::SendGoalOptions();
-        options.goal_response_callback = [this, key, attempt](const ExecuteSubtaskGoalHandle::SharedPtr &goal_handle)
-        { goal_response_callback(goal_handle, key, attempt); };
-        options.feedback_callback = [this, key, attempt](ExecuteSubtaskGoalHandle::SharedPtr goal_handle,
-                                                         const std::shared_ptr<const ExecuteSubtask::Feedback> feedback)
-        { goal_feedback_callback(goal_handle, feedback, key, attempt); };
-        options.result_callback = [this, key, attempt](const ExecuteSubtaskGoalHandle::WrappedResult &result)
-        { goal_result_callback(result, key, attempt); };
+        options.goal_response_callback = [this, key, attempt, robot](const ExecuteSubtaskGoalHandle::SharedPtr &goal_handle)
+        { goal_response_callback(goal_handle, key, attempt, robot); };
+        options.feedback_callback = [this, key, attempt, robot](ExecuteSubtaskGoalHandle::SharedPtr goal_handle,
+                                                                const std::shared_ptr<const ExecuteSubtask::Feedback> feedback)
+        { goal_feedback_callback(goal_handle, feedback, key, attempt, robot); };
+        options.result_callback = [this, key, attempt, robot](const ExecuteSubtaskGoalHandle::WrappedResult &result)
+        { goal_result_callback(result, key, attempt, robot); };
 
         // send the goal
         RCLCPP_INFO(this->get_logger(), "Sending %s: task %s, timeout %.1f s (%.2f s real)",
                     label(record).c_str(), record.task_type.c_str(), record.timeout_nominal_sec, real_timeout_sec);
         clients_.at(record.robot)->async_send_goal(goal, options); // send the goal asynchronously, to this subtask's robot
 
-        // optional test cancel: a one-shot timer that sends a cancel request cancel_after_sec (nominal) after sending the goal
+        // Optional test cancel: a one-shot timer that cancels this subtask cancel_after_sec (nominal) after sending it.
+        // Only for the first attempt (a reassigned attempt is not canceled again), and only for the subtask named by
+        // cancel_subtask (empty = every subtask), so cancelling one subtask leaves the others running (Phase B point 5).
         const double cancel_after_nominal_sec = this->get_parameter("cancel_after_sec").as_double();
         const double cancel_after_sec = cancel_after_nominal_sec / time_scale_; // real seconds, for the timer
-        if (cancel_after_sec > 0.0)
+        const std::string cancel_target = this->get_parameter("cancel_subtask").as_string();
+        const bool targeted = cancel_target.empty() || cancel_target == record.subtask_id;
+        if (cancel_after_sec > 0.0 && targeted && attempt == 1)
         {
             RCLCPP_INFO(this->get_logger(), "%s will be canceled after %.1f s (cancel_after_sec)", label(record).c_str(), cancel_after_nominal_sec);
             record.cancel_timer = this->create_wall_timer(
@@ -315,47 +332,106 @@ private:
     // Cancellation
     // ---------------------------------------------------------------------------------------------
 
-    // Fires once, cancel_after_sec after the attempt was sent, and asks the robot to cancel it.
+    // Fires once, cancel_after_sec after the attempt was sent: cancels this subtask only, then, if the test parameter
+    // reassign_to names a robot, reassigns the subtask to it (a minimal "reassignment" repair, Phase B point 5).
     void cancel_timer_callback(const SubtaskKey &key, int attempt)
     {
-        SubtaskRecord *record = current_record(key, attempt, "test cancel");
+        SubtaskRecord *record = current_record(key, attempt, subtasks_.at(key).robot, "test cancel");
         if (!record)
             return;
         record->cancel_timer->cancel(); // one-shot: a timer repeats unless it is canceled
 
-        // nothing to cancel if the goal was not accepted yet, was rejected, or has already finished
-        if (!record->goal_handle || record->state != SubtaskState::RUNNING)
-        {
-            RCLCPP_WARN(this->get_logger(), "Cannot cancel %s: not running (state %s)", label(*record).c_str(), to_string(record->state));
-            return;
-        }
+        if (!request_cancel(key))
+            return; // not running: nothing to cancel, so nothing to reassign either
 
-        RCLCPP_INFO(this->get_logger(), "Sending cancel request for %s", label(*record).c_str());
-        record->cancel_requested = true;
+        const std::string reassign_to = this->get_parameter("reassign_to").as_string();
+        if (!reassign_to.empty())
+            reassign(key, reassign_to);
+    }
+
+    // Asks the robot running the current attempt of `key` to cancel it, and only that subtask (Phase B point 5):
+    // the request goes through the client of that subtask's robot, with that attempt's goal handle, so the other
+    // subtasks (on the same robot or on others) are not affected. Returns true if a cancel request was sent.
+    // Asynchronous: the robot's answer arrives in cancel_response_callback, and the final CANCELED result arrives
+    // later in goal_result_callback. This is the function a repair (reassign, hold) uses to stop a subtask.
+    bool request_cancel(const SubtaskKey &key)
+    {
+        SubtaskRecord &record = subtasks_.at(key);
+
+        // nothing to cancel if the goal was not accepted yet, was rejected, or has already finished
+        if (!record.goal_handle || record.state != SubtaskState::RUNNING)
+        {
+            RCLCPP_WARN(this->get_logger(), "Cannot cancel %s: not running (state %s)", label(record).c_str(), to_string(record.state));
+            return false;
+        }
+        if (record.cancel_requested)
+            return true; // already asked: do not send a second request
+
+        const int attempt = record.attempt;
+        const std::string robot = record.robot;
+        RCLCPP_INFO(this->get_logger(), "Sending cancel request for %s", label(record).c_str());
+        record.cancel_requested = true;
         try
         {
-            // asynchronous: the robot's answer arrives in cancel_response_callback,
-            // and the final CANCELED result arrives later in goal_result_callback
             // the cancel goes through the client of the robot running this attempt (the goal handle belongs to it)
-            clients_.at(record->robot)->async_cancel_goal(
-                record->goal_handle,
-                [this, key, attempt](const CancelResponse::SharedPtr response) { cancel_response_callback(response, key, attempt); });
+            clients_.at(robot)->async_cancel_goal(
+                record.goal_handle,
+                [this, key, attempt, robot](const CancelResponse::SharedPtr response)
+                { cancel_response_callback(response, key, attempt, robot); });
         }
         catch (const rclcpp_action::exceptions::UnknownGoalHandleError &)
         {
             // the goal ended between the check above and the request: there is nothing left to cancel
-            record->cancel_requested = false;
-            RCLCPP_WARN(this->get_logger(), "Cannot cancel %s: the goal has already finished", label(*record).c_str());
+            record.cancel_requested = false;
+            RCLCPP_WARN(this->get_logger(), "Cannot cancel %s: the goal has already finished", label(record).c_str());
+            return false;
         }
+        return true;
+    }
+
+    // Reassigns subtask `key` to `new_robot` as a new attempt (Phase B point 5; the "reassign" repair).
+    // The current attempt must already have been asked to stop (request_cancel); the new robot does not wait for
+    // that stop to be confirmed, since it is a different robot. The attempt number is incremented NOW, so any late
+    // answer from the old attempt (its CANCELED result, a feedback, the cancel answer) is recognised as stale and
+    // ignored by current_record. The subtask is queued again and dispatch_pending_goals sends it to the new robot.
+    void reassign(const SubtaskKey &key, const std::string &new_robot)
+    {
+        SubtaskRecord &record = subtasks_.at(key);
+        if (clients_.count(new_robot) == 0)
+        {
+            RCLCPP_ERROR(this->get_logger(), "Cannot reassign %s: unknown robot '%s'", label(record).c_str(), new_robot.c_str());
+            return;
+        }
+
+        const std::string old_label = label(record);
+        record.attempt += 1;
+        record.robot = new_robot;
+        record.state = SubtaskState::WAITING_FOR_ROBOT;
+        record.goal_handle.reset();      // the old attempt's handle belongs to the old robot
+        record.cancel_requested = false; // the cancel request concerned the old attempt
+        record.blocked = false;
+        record.at_risk = false;
+        record.waiting_since = std::chrono::steady_clock::now();
+        record.waiting_warned = false;
+        RCLCPP_WARN(this->get_logger(), "Reassigning %s to robot %s as attempt #%d",
+                    old_label.c_str(), new_robot.c_str(), record.attempt);
     }
 
     // The robot's answer to the cancel request. Accepting only means the robot will stop;
     // the goal really ends when the CANCELED result arrives in goal_result_callback.
-    void cancel_response_callback(const CancelResponse::SharedPtr response, const SubtaskKey &key, int attempt)
+    void cancel_response_callback(const CancelResponse::SharedPtr response, const SubtaskKey &key, int attempt,
+                                  const std::string &robot)
     {
-        SubtaskRecord *record = current_record(key, attempt, "cancel answer");
+        SubtaskRecord *record = current_record(key, attempt, robot, "cancel answer");
         if (!record)
+        {
+            // Answer about an old attempt (the subtask was reassigned). Ignored for the record, but if the old robot
+            // refused to stop, it is still executing the subtask, so the subtask now runs on two robots: report it.
+            if (response->return_code == CancelResponse::ERROR_REJECTED)
+                RCLCPP_ERROR(this->get_logger(), "Old attempt %s/%s#%d@%s refused to stop: it is still running on %s",
+                             key.first.c_str(), key.second.c_str(), attempt, robot.c_str(), robot.c_str());
             return;
+        }
         const std::string name = label(*record);
 
         switch (response->return_code)
@@ -384,11 +460,30 @@ private:
     // Goal response, feedback, result
     // ---------------------------------------------------------------------------------------------
 
-    void goal_response_callback(const ExecuteSubtaskGoalHandle::SharedPtr &goal_handle, const SubtaskKey &key, int attempt)
+    void goal_response_callback(const ExecuteSubtaskGoalHandle::SharedPtr &goal_handle, const SubtaskKey &key, int attempt,
+                                const std::string &robot)
     {
-        SubtaskRecord *record = current_record(key, attempt, "goal response");
+        SubtaskRecord *record = current_record(key, attempt, robot, "goal response");
         if (!record)
+        {
+            // The old robot accepted an attempt that was replaced while its acceptance was on the way (the subtask was
+            // reassigned between sending and accepting). Nobody follows that goal any more: cancel it, otherwise the
+            // old robot would execute the subtask in parallel with the new one.
+            if (goal_handle)
+            {
+                RCLCPP_WARN(this->get_logger(), "Canceling orphan attempt %s/%s#%d@%s accepted after it was replaced",
+                            key.first.c_str(), key.second.c_str(), attempt, robot.c_str());
+                try
+                {
+                    clients_.at(robot)->async_cancel_goal(goal_handle);
+                }
+                catch (const rclcpp_action::exceptions::UnknownGoalHandleError &)
+                {
+                    // already finished: nothing to stop
+                }
+            }
             return;
+        }
 
         if (!goal_handle)
         {
@@ -412,10 +507,10 @@ private:
     // not only when the robot's timeout fires at the end.
     void goal_feedback_callback(ExecuteSubtaskGoalHandle::SharedPtr goal_handle,
                                 const std::shared_ptr<const ExecuteSubtask::Feedback> feedback,
-                                const SubtaskKey &key, int attempt)
+                                const SubtaskKey &key, int attempt, const std::string &robot)
     {
         (void)goal_handle; // the record (found with key and attempt) already identifies the goal
-        SubtaskRecord *record = current_record(key, attempt, "feedback");
+        SubtaskRecord *record = current_record(key, attempt, robot, "feedback");
         if (!record)
             return;
         const std::string name = label(*record);
@@ -491,9 +586,12 @@ private:
     }
 
     // calback to receive the result once the goal is done
-    void goal_result_callback(const ExecuteSubtaskGoalHandle::WrappedResult &result, const SubtaskKey &key, int attempt)
+    void goal_result_callback(const ExecuteSubtaskGoalHandle::WrappedResult &result, const SubtaskKey &key, int attempt,
+                              const std::string &robot)
     {
-        SubtaskRecord *record = current_record(key, attempt, "result");
+        // A result from an old attempt (e.g. the CANCELED result of the attempt that was reassigned) is ignored:
+        // it must not mark the subtask as finished while its new attempt is running on another robot.
+        SubtaskRecord *record = current_record(key, attempt, robot, "result");
         if (!record)
             return;
 
