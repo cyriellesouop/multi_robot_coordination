@@ -218,7 +218,7 @@ Run `ros2 interface show multi_robot_interfaces/action/ExecuteSubtask` to see th
 | File | Purpose |
 |---|---|
 | `src/robot_action_server.cpp` | **Mock robot.** Action server `robot_action_server` on `execute_subtask`. Rejects a goal if `mission_id` or `subtask_id` is empty, if the task type is not `navigate` (the only task implemented so far), if `timeout_sec` is not greater than the 5 s it needs, if the same subtask already succeeded, or if it is busy with another subtask. Executes accepted goals in a separate thread: simulates navigation in 5 steps while publishing feedback (progress and estimated time to completion), and checks for cancellation and timeout at least every 0.1 s and once more after the last step. Parameters: `robot_name` (how the robot identifies itself in its feedback and logs; by default its namespace, e.g. `robot1` for `/robot1`; read-only), `step_duration_sec` (nominal duration of a step, default 1.0: the robot's speed, so robots can differ) and `time_scale` (speed-up of the whole experiment, default 1.0); the 5 s it needs, `simulated_delay_sec` and `timeout_sec` checks all follow them. A canceled or timed-out goal returns a partial result (times, recoveries, remaining distance, last pose). It uses a multi-threaded executor, and the thread running the goal is joined on shutdown (Ctrl+C aborts an active goal cleanly). Successful subtasks are remembered; failed or canceled ones can be retried. It can simulate a deviation: with the parameter `simulated_delay_sec` greater than 0, the robot gets blocked for that many nominal seconds at step `delay_at_step` (default 2), publishes `BLOCKED` feedback with a growing time estimate and one recovery, and still honours cancellation and timeout. See [TESTING.md](TESTING.md) for manual tests. |
-| `src/coordinator_action_client.cpp` | **Coordinator.** Action client node `coordinator_action_client`. Queues one hard-coded subtask and sends it as soon as the `execute_subtask` server is available: it never blocks waiting for a robot, it checks every 100 ms, and warns after 2 s if the robot is still missing (it can be started before or after the robot, and stops cleanly with Ctrl+C while waiting). It keeps one record per subtask, indexed by mission and subtask id (robot, state, attempt number, goal handle, deadline, deviation flags, cancel state), so state is never shared between subtasks, and every callback carries the attempt it belongs to so a late answer from an old attempt is ignored. Logs name a subtask as `mission/subtask#attempt@robot`. The subtask is a hard-coded `navigate` goal (mission `mission1`, subtask `subtask1`, timeout 30 s), logs whether the goal was accepted or rejected, then the final status and result fields. A result or a rejection only updates its own subtask; the coordinator stops by itself only when every subtask is in a final state, after logging a mission summary (one line per subtask and the counts). The parameter `subtask_count` (default 1) queues `subtask1` ... `subtaskN` to test several subtasks. It computes, from each feedback message, the margin between the time left before the deadline and the time the robot still needs, and reports a deviation when it starts and when it ends (robot `BLOCKED`, margin negative = subtask at risk), not on every message; the per-feedback progress line is at debug level. With the parameter `time_scale` (same value as the robots') the scenario is given in nominal seconds and all times in its logs are nominal, so a run prints the same numbers at any speed. The deadline is currently the goal's own `timeout_sec`; it will come from the workflow model. With the parameter `cancel_after_sec` greater than 0 it sends a cancel request that many seconds after the goal and logs the robot's answer (accepted, rejected, unknown or already finished) and the `CANCELED` result; the default is 0, no cancel. It uses a single-threaded executor and never blocks in a callback. It does not repair the workflow yet. |
+| `src/coordinator_action_client.cpp` | **Coordinator.** Action client node `coordinator_action_client`. Runs without a namespace and creates one action client per robot of the fleet (parameter `robots`, default `[robot1, robot2, robot3]`, the names used by `mock_fleet.launch.py`), each on the absolute action `/<robot>/execute_subtask`, so it can drive the whole fleet and several subtasks run in parallel on different robots. It queues its subtasks and sends each as soon as its robot's server is available: it never blocks waiting for a robot, it checks every 100 ms, and warns after 2 s if a robot is still missing (the other robots are not affected, and it stops cleanly with Ctrl+C while waiting). It keeps one record per subtask, indexed by mission and subtask id (robot, state, attempt number, goal handle, deadline, deviation flags, cancel state), so state is never shared between subtasks, and every callback carries the attempt it belongs to so a late answer from an old attempt is ignored. Logs name a subtask as `mission/subtask#attempt@robot`. The test mission is hard-coded: `navigate` subtasks `subtask1` ... of `mission1`, timeout 30 s each, one per robot in turn (`subtask_count` sets how many), logs whether the goal was accepted or rejected, then the final status and result fields. A result or a rejection only updates its own subtask; the coordinator stops by itself only when every subtask is in a final state, after logging a mission summary (one line per subtask and the counts). The parameter `subtask_count` (default 0 = one subtask per robot) sets the number of subtasks, assigned to the robots in turn. It computes, from each feedback message, the margin between the time left before the deadline and the time the robot still needs, and reports a deviation when it starts and when it ends (robot `BLOCKED`, margin negative = subtask at risk), not on every message; the per-feedback progress line is at debug level. With the parameter `time_scale` (same value as the robots') the scenario is given in nominal seconds and all times in its logs are nominal, so a run prints the same numbers at any speed. The deadline is currently the goal's own `timeout_sec`; it will come from the workflow model. With the parameter `cancel_after_sec` greater than 0 it sends a cancel request that many seconds after the goal and logs the robot's answer (accepted, rejected, unknown or already finished) and the `CANCELED` result; the default is 0, no cancel. It uses a single-threaded executor and never blocks in a callback. It does not repair the workflow yet. |
 | `launch/mock_fleet.launch.py` | Starts one `robot_action_server` per robot of the fleet file, each in its own namespace (`/<name>`), with the same `time_scale`. Launch arguments: `time_scale` (default 1.0) and `fleet_config` (YAML file, default `config/mock_fleet.yaml`). It stops with an error if the file has no robots, a robot without a name, or a name used twice. |
 | `config/mock_fleet.yaml` | The mock fleet: one entry per robot with its `name` (namespace) and optionally `step_duration_sec` (speed), `simulated_delay_sec` and `delay_at_step`. Three robots with different speeds by default. All durations are nominal seconds. |
 | `CMakeLists.txt` | Builds and installs the `robot_action_server` and `coordinator_action_client` executables, and installs the `launch/` and `config/` folders. |
@@ -256,51 +256,41 @@ ros2 action send_goal /execute_subtask multi_robot_interfaces/action/ExecuteSubt
 You should see five feedback messages, then a result with status `SUCCEEDED`. Press `Ctrl+C` during
 execution to request a cancellation.
 
-Or, with the mock robot running, start the coordinator client in a second terminal instead:
-
-```bash
-ros2 run actions coordinator_action_client
-```
-
-After about 5 s it logs the result (`SUCCEEDED`, `error_code=0`, execution and navigation times) and a mission summary, and exits. With `-p subtask_count:=2` it queues two subtasks for the same robot: the robot, which runs one subtask at a time, rejects the second, and the first still finishes before the coordinator stops.
-A goal with `timeout_sec` of 5 s or less (or 0 or negative) is rejected by the robot; the client logs the rejection and exits.
-
-To test cancellation, ask the client to cancel the goal 2 s after sending it. The robot stops within 0.1 s and the client logs the cancel answer and a `CANCELED` result with the partial data (about 2 s of execution):
-
-```bash
-ros2 run actions coordinator_action_client --ros-args -p cancel_after_sec:=2.0
-```
-
-To run an experiment faster than real time, give the same `time_scale` to the robot and the client; durations stay in nominal seconds, so the results are the same but a 30 s run takes 3 s at `time_scale:=10.0`:
-
-```bash
-ros2 run actions robot_action_server --ros-args -p time_scale:=10.0
-ros2 run actions coordinator_action_client --ros-args -p time_scale:=10.0
-```
-
-To start the whole mock fleet with one command (three robots with different speeds, defined in `config/mock_fleet.yaml`), optionally faster than real time:
+To run the coordinator on the whole mock fleet, start the fleet with one command (three robots with different speeds, defined in `config/mock_fleet.yaml`), optionally faster than real time, then the coordinator in a second terminal:
 
 ```bash
 ros2 launch actions mock_fleet.launch.py time_scale:=10.0
+ros2 run actions coordinator_action_client --ros-args -p time_scale:=10.0
 ```
 
-Each robot is then at `/robot1/execute_subtask`, `/robot2/execute_subtask` and `/robot3/execute_subtask`; edit the YAML file (or pass `fleet_config:=<file>`) to change the robots. To start a single robot by hand instead, start it in its own namespace: the action then becomes `/robot2/execute_subtask` and the robot reports itself as `robot2` (or as the name given with `-p robot_name:=...`). The client must currently be started in the same namespace to find it:
+The coordinator sends one subtask to each robot at the same time. Each robot is at `/robot1/execute_subtask`, `/robot2/execute_subtask` and `/robot3/execute_subtask`; edit the YAML file (or pass `fleet_config:=<file>`) to change the robots, and give the coordinator the same names with `-p "robots:=[robot1,robot2,robot3]"`. Each subtask runs at its robot's speed (about 5.0, 7.5 and 4.0 s), and the coordinator ends with a mission summary. Give the same `time_scale` to the fleet and the coordinator; durations stay in nominal seconds, so the results are the same but a run takes a tenth of the time at `time_scale:=10.0`.
+
+With `-p subtask_count:=4` the fourth subtask goes to robot1 while it is busy: the robot, which runs one subtask at a time, rejects it, and the other three still finish. The coordinator never waits for a missing robot: with a robot named in `robots` that is not running, its subtasks stay queued (with a warning after 2 s) and the others run.
+A goal with `timeout_sec` of 5 s or less (or 0 or negative) is rejected by a robot with default speed.
+
+To test cancellation, ask the coordinator to cancel its running subtasks 2 s after sending them. The robots stop within 0.1 s and the coordinator logs the cancel answers and `CANCELED` results with the partial data (about 2 s of execution):
 
 ```bash
-ros2 run actions robot_action_server --ros-args -r __ns:=/robot2
-ros2 run actions coordinator_action_client --ros-args -r __ns:=/robot2
+ros2 run actions coordinator_action_client --ros-args -p time_scale:=10.0 -p cancel_after_sec:=2.0
 ```
 
-To make a robot slower or faster than the others, set its `step_duration_sec` (for example `-p step_duration_sec:=2.0` makes the subtask take 10 s instead of 5 s).
+To make a robot slower or faster than the others, set its `step_duration_sec` in the YAML file (for example `2.0` makes the subtask take 10 s instead of 5 s).
 
-To see a deviation detected before the timeout, restart the robot with a simulated blockage of 30 s and run the client again:
+To start a single robot by hand instead, start it in its own namespace: the action becomes `/robot2/execute_subtask` and the robot reports itself as `robot2` (or as the name given with `-p robot_name:=...`):
 
 ```bash
-ros2 run actions robot_action_server --ros-args -p simulated_delay_sec:=30.0
-ros2 run actions coordinator_action_client
+ros2 run actions robot_action_server --ros-args -r __ns:=/robot2 -p time_scale:=10.0
+ros2 run actions coordinator_action_client --ros-args -p time_scale:=10.0 -p "robots:=[robot2]"
 ```
 
-The client logs one `BLOCKED` warning at about 2 s, one `AT RISK` warning at about 15 s (when the time left before the deadline becomes shorter than the time the robot needs), and the goal ends `ABORTED` with `ERROR_TIMEOUT` at 30 s. With a shorter blockage, for example `simulated_delay_sec:=5.0`, it logs when the robot is no longer blocked and the goal succeeds. Add `--log-level coordinator_action_client:=debug` to see every feedback message. Restart the robot between runs of the same subtask, because it rejects a subtask that already succeeded.
+To see a deviation detected before the timeout, give a robot a simulated blockage of 30 s, either with `simulated_delay_sec: 30.0` for it in the YAML file (rebuild afterwards) or on a single robot started by hand:
+
+```bash
+ros2 run actions robot_action_server --ros-args -r __ns:=/robot1 -p time_scale:=10.0 -p simulated_delay_sec:=30.0
+ros2 run actions coordinator_action_client --ros-args -p time_scale:=10.0 -p "robots:=[robot1]"
+```
+
+The coordinator logs one `BLOCKED` warning at about 2 s, one `AT RISK` warning at about 15 s (when the time left before the deadline becomes shorter than the time the robot needs), and that subtask ends `ABORTED` with `ERROR_TIMEOUT` at 30 s while the other robots' subtasks finish normally. With a shorter blockage, for example `simulated_delay_sec:=5.0`, it logs when the robot is no longer blocked and the subtask succeeds. Add `--log-level coordinator_action_client:=debug` to see every feedback message. Restart the robots between runs, because a robot rejects a subtask that already succeeded.
 See [TESTING.md](TESTING.md) for the complete list of manual tests.
 
 ## Status
@@ -315,6 +305,10 @@ See [TESTING.md](TESTING.md) for the complete list of manual tests.
 - [ ] Nova Carter robot server (Nav2)
 
 ## Changelog
+
+### 2026-10-15 - Drive the whole fleet with one action client per robot
+- The coordinator runs without a namespace and creates one action client per robot (parameter `robots`), so it sends subtasks to several robots in parallel; a missing robot only delays its own subtasks (fourth of the five Phase B coordinator changes).
+- Run `ros2 launch actions mock_fleet.launch.py time_scale:=10.0`, then `ros2 run actions coordinator_action_client --ros-args -p time_scale:=10.0`; build with `colcon build --packages-select actions`.
 
 ### 2026-10-15 - Stop the coordinator only when the whole mission is finished
 - A result or a rejection no longer shuts the coordinator down; each only updates its own subtask, and the coordinator logs a mission summary and stops when every subtask is final (third of the five Phase B coordinator changes). New test parameter `subtask_count`.

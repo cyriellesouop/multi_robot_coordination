@@ -5,8 +5,10 @@
 #include <chrono>
 #include <algorithm>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 using ExecuteSubtask = multi_robot_interfaces::action::ExecuteSubtask;
 using ExecuteSubtaskGoalHandle = rclcpp_action::ClientGoalHandle<ExecuteSubtask>;
@@ -93,12 +95,20 @@ class CoordinatorActionClientNode : public rclcpp::Node // MODIFY NAME
 public:
     CoordinatorActionClientNode() : Node("coordinator_action_client") // MODIFY NAME
     {
-        coordinator_action_client_ = rclcpp_action::create_client<ExecuteSubtask>(this, "execute_subtask");
-        // full action name, for the logs (rclcpp_action::Client has no getter for it in Humble)
-        action_name_ = std::string(this->get_namespace()) == "/" ? "/execute_subtask" : std::string(this->get_namespace()) + "/execute_subtask";
-        // name of the robot behind that action (the namespace, e.g. "robot1"); Phase B point 4 replaces this
-        // single client with one client per robot of the fleet
-        robot_name_ = std::string(this->get_namespace()) == "/" ? "robot" : std::string(this->get_namespace()).substr(1);
+        // One action client per robot of the fleet (Phase B, point 4).
+        // robots: names of the robots, the same names as the namespaces of mock_fleet.launch.py
+        // (robot1 -> action /robot1/execute_subtask). The coordinator itself runs WITHOUT a namespace and
+        // addresses each robot by its absolute action name, so it can talk to the whole fleet.
+        const auto robots = this->declare_parameter<std::vector<std::string>>("robots", {"robot1", "robot2", "robot3"});
+        if (robots.empty())
+            throw std::runtime_error("parameter 'robots' is empty: the coordinator needs at least one robot");
+        for (const auto &robot : robots)
+        {
+            const std::string action_name = "/" + robot + "/execute_subtask"; // absolute: independent of the coordinator's namespace
+            clients_[robot] = rclcpp_action::create_client<ExecuteSubtask>(this, action_name);
+            action_names_[robot] = action_name;
+            robot_order_.push_back(robot);
+        }
 
         // time_scale: how much faster than real time the experiment runs; must be the same value as the robots'.
         // Durations of the scenario (timeout, cancel time) are given in NOMINAL seconds and divided by
@@ -119,13 +129,18 @@ public:
         // Used to test cancellation; later the coordinator's own logic (e.g. a repair) will decide when to cancel.
         this->declare_parameter("cancel_after_sec", 0.0);
 
-        // subtask_count: number of subtasks main() queues for the robot (subtask1, subtask2, ...), default 1.
-        // A test aid until the workflow model provides the mission: with 2 or more, the robot (which runs one
-        // subtask at a time) rejects the extra ones as busy while the first keeps running, which shows that one
-        // rejected or finished subtask no longer stops the coordinator (Phase B point 3).
-        this->declare_parameter("subtask_count", 1);
+        // subtask_count: number of subtasks main() queues (subtask1, subtask2, ...), assigned to the robots in turn
+        // (subtask1 -> first robot, subtask2 -> second robot, ...; after the last robot it starts again with the first).
+        // 0 (default) = one subtask per robot. A test aid until the workflow model provides the mission: with more
+        // subtasks than robots, a robot receives a second subtask while busy and rejects it, which shows that one
+        // rejected or finished subtask does not stop the others (Phase B point 3).
+        this->declare_parameter("subtask_count", 0);
 
         RCLCPP_INFO(this->get_logger(), "Time scale %.1f: all times in this node's logs are nominal seconds", time_scale_);
+        std::string fleet;
+        for (const auto &robot : robot_order_)
+            fleet += " " + action_names_[robot];
+        RCLCPP_INFO(this->get_logger(), "Fleet of %zu robot(s):%s", robot_order_.size(), fleet.c_str());
 
         // Non-blocking server discovery (Phase B, point 1).
         // Goals are not sent directly: send_goal() queues them, and this timer sends a queued goal as soon as
@@ -135,10 +150,22 @@ public:
         dispatch_timer_ = this->create_wall_timer(std::chrono::milliseconds(100), [this]() { dispatch_pending_goals(); });
     }
 
-    // Queues a subtask; it is sent by dispatch_pending_goals() when the robot's action server is available.
+    // Robots of the fleet, in the order of the `robots` parameter (used by main() to assign test subtasks).
+    const std::vector<std::string> &robots() const { return robot_order_; }
+
+    // Queues a subtask for `robot`; it is sent by dispatch_pending_goals() when that robot's action server is available.
     // timeout_sec is in nominal seconds: it is converted to real seconds with time_scale when the goal is sent.
-    void send_goal(std::string mission_id, std::string subtask_id, std::string task_type, geometry_msgs::msg::PoseStamped target_pose, double timeout_sec)
+    void send_goal(std::string mission_id, std::string subtask_id, std::string robot, std::string task_type,
+                   geometry_msgs::msg::PoseStamped target_pose, double timeout_sec)
     {
+        if (clients_.count(robot) == 0)
+        {
+            // only robots listed in the `robots` parameter have a client
+            RCLCPP_ERROR(this->get_logger(), "Subtask %s/%s: unknown robot '%s' (not in the 'robots' parameter), not queued",
+                         mission_id.c_str(), subtask_id.c_str(), robot.c_str());
+            return;
+        }
+
         const SubtaskKey key{mission_id, subtask_id};
         if (subtasks_.count(key) > 0)
         {
@@ -150,7 +177,7 @@ public:
         SubtaskRecord record;
         record.mission_id = mission_id;
         record.subtask_id = subtask_id;
-        record.robot = robot_name_;
+        record.robot = robot; // the robot it is assigned to; its client is clients_[robot]
         record.task_type = task_type;
         record.target_pose = target_pose;
         record.timeout_nominal_sec = timeout_sec;
@@ -159,7 +186,7 @@ public:
         subtasks_[key] = record;
 
         RCLCPP_INFO(this->get_logger(), "Subtask %s/%s queued for robot %s, will be sent when its action server is available",
-                    mission_id.c_str(), subtask_id.c_str(), robot_name_.c_str());
+                    mission_id.c_str(), subtask_id.c_str(), robot.c_str());
     }
 
 private:
@@ -196,7 +223,8 @@ private:
 
     // Called every 100 ms by dispatch_timer_. Sends every queued subtask whose robot's action server is available,
     // and leaves the others queued (never waits). action_server_is_ready() only checks what ROS has already
-    // discovered, so it does not block.
+    // discovered, so it does not block. Each subtask uses the client of its own robot, so a missing robot only
+    // delays its own subtasks, not those of the other robots.
     void dispatch_pending_goals()
     {
         for (auto &entry : subtasks_)
@@ -205,14 +233,14 @@ private:
             if (record.state != SubtaskState::WAITING_FOR_ROBOT)
                 continue; // already sent, or finished
 
-            if (!coordinator_action_client_->action_server_is_ready())
+            if (!clients_.at(record.robot)->action_server_is_ready())
             {
                 // robot not available (not started yet, or gone): keep the subtask queued and try again at the next tick
                 const double waiting_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - record.waiting_since).count();
                 if (!record.waiting_warned && waiting_sec >= kWaitingWarningSec)
                 {
                     RCLCPP_WARN(this->get_logger(), "Subtask %s/%s: robot action server '%s' not available after %.1f s (real), still waiting",
-                                record.mission_id.c_str(), record.subtask_id.c_str(), action_name_.c_str(), waiting_sec);
+                                record.mission_id.c_str(), record.subtask_id.c_str(), action_names_.at(record.robot).c_str(), waiting_sec);
                     record.waiting_warned = true;
                 }
                 continue;
@@ -268,7 +296,7 @@ private:
         // send the goal
         RCLCPP_INFO(this->get_logger(), "Sending %s: task %s, timeout %.1f s (%.2f s real)",
                     label(record).c_str(), record.task_type.c_str(), record.timeout_nominal_sec, real_timeout_sec);
-        coordinator_action_client_->async_send_goal(goal, options); // send the goal asynchronously
+        clients_.at(record.robot)->async_send_goal(goal, options); // send the goal asynchronously, to this subtask's robot
 
         // optional test cancel: a one-shot timer that sends a cancel request cancel_after_sec (nominal) after sending the goal
         const double cancel_after_nominal_sec = this->get_parameter("cancel_after_sec").as_double();
@@ -308,7 +336,8 @@ private:
         {
             // asynchronous: the robot's answer arrives in cancel_response_callback,
             // and the final CANCELED result arrives later in goal_result_callback
-            coordinator_action_client_->async_cancel_goal(
+            // the cancel goes through the client of the robot running this attempt (the goal handle belongs to it)
+            clients_.at(record->robot)->async_cancel_goal(
                 record->goal_handle,
                 [this, key, attempt](const CancelResponse::SharedPtr response) { cancel_response_callback(response, key, attempt); });
         }
@@ -552,9 +581,10 @@ private:
     // converts a real duration (as measured or reported by the robots) to nominal seconds, for the logs
     double nominal(double real_sec) const { return real_sec * time_scale_; }
 
-    rclcpp_action::Client<ExecuteSubtask>::SharedPtr coordinator_action_client_;
-    std::string action_name_; // full name of the robot's action (e.g. /robot1/execute_subtask), for the logs
-    std::string robot_name_;  // name of the robot behind coordinator_action_client_ (e.g. robot1)
+    // One action client per robot, indexed by robot name (Phase B point 4). Created once in the constructor.
+    std::map<std::string, rclcpp_action::Client<ExecuteSubtask>::SharedPtr> clients_;
+    std::map<std::string, std::string> action_names_; // robot name -> its action name (e.g. /robot1/execute_subtask), for the logs
+    std::vector<std::string> robot_order_;            // robot names in the order of the `robots` parameter
     double time_scale_ = 1.0; // value of the time_scale parameter, read once at start-up
 
     // All subtasks known to the coordinator, one record each, indexed by (mission_id, subtask_id).
@@ -571,10 +601,18 @@ int main(int argc, char **argv)
     rclcpp::init(argc, argv);
     auto node = std::make_shared<CoordinatorActionClientNode>(); // MODIFY NAME
 
-    // queue subtask1 ... subtaskN of mission1 (N = subtask_count, at least 1); later the workflow provides the mission
-    const int subtask_count = std::max<int>(1, static_cast<int>(node->get_parameter("subtask_count").as_int()));
+    // Test mission until the workflow model provides real missions: queue subtask1 ... subtaskN of mission1,
+    // assigned to the robots in turn (subtask1 -> first robot, subtask2 -> second robot, ...).
+    // N = subtask_count, or one subtask per robot when subtask_count is 0 (the default).
+    const auto &robots = node->robots();
+    int subtask_count = static_cast<int>(node->get_parameter("subtask_count").as_int());
+    if (subtask_count <= 0)
+        subtask_count = static_cast<int>(robots.size());
     for (int i = 1; i <= subtask_count; ++i)
-        node->send_goal("mission1", "subtask" + std::to_string(i), "navigate", geometry_msgs::msg::PoseStamped(), 30.0);
+    {
+        const std::string &robot = robots[(i - 1) % robots.size()]; // round-robin over the fleet
+        node->send_goal("mission1", "subtask" + std::to_string(i), robot, "navigate", geometry_msgs::msg::PoseStamped(), 30.0);
+    }
 
     // Single-threaded on purpose: all the coordinator's callbacks (goal response, feedback, result,
     // cancel timer, cancel response) run one at a time, so its state (the subtask records, and later the
