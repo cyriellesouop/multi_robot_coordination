@@ -3,6 +3,7 @@
 #include "action_msgs/srv/cancel_goal.hpp"
 #include "multi_robot_interfaces/action/execute_subtask.hpp"
 #include <chrono>
+#include <algorithm>
 #include <map>
 #include <string>
 #include <utility>
@@ -38,6 +39,14 @@ static const char *to_string(SubtaskState state)
     case SubtaskState::REJECTED: return "REJECTED";
     }
     return "UNKNOWN";
+}
+
+// True for the states a subtask cannot leave by itself (Phase B, point 3). The mission is finished when every
+// subtask is in one of them. (Later, a repair may restart a final subtask as a new attempt: retry or reassign.)
+static bool is_final(SubtaskState state)
+{
+    return state == SubtaskState::SUCCEEDED || state == SubtaskState::ABORTED ||
+           state == SubtaskState::CANCELED || state == SubtaskState::REJECTED;
 }
 
 // A subtask is identified by its mission and its id: subtask_id is only unique inside its mission.
@@ -109,6 +118,12 @@ public:
         // cancel_after_sec: send a cancel request this many nominal seconds after a subtask is sent (0 = never).
         // Used to test cancellation; later the coordinator's own logic (e.g. a repair) will decide when to cancel.
         this->declare_parameter("cancel_after_sec", 0.0);
+
+        // subtask_count: number of subtasks main() queues for the robot (subtask1, subtask2, ...), default 1.
+        // A test aid until the workflow model provides the mission: with 2 or more, the robot (which runs one
+        // subtask at a time) rejects the extra ones as busy while the first keeps running, which shows that one
+        // rejected or finished subtask no longer stops the coordinator (Phase B point 3).
+        this->declare_parameter("subtask_count", 1);
 
         RCLCPP_INFO(this->get_logger(), "Time scale %.1f: all times in this node's logs are nominal seconds", time_scale_);
 
@@ -351,7 +366,9 @@ private:
             // a rejected goal never existed on the robot: there is nothing to cancel and no result will come
             record->state = SubtaskState::REJECTED;
             RCLCPP_WARN(this->get_logger(), "%s was rejected by the robot", label(*record).c_str());
-            rclcpp::shutdown(); // TEMPORARY: removed in Phase B point 3 (the mission, not one subtask, decides when to stop)
+            // Phase B point 3: a rejection only updates this subtask; the other subtasks keep running.
+            // The coordinator stops only when the whole mission is finished.
+            check_mission_finished();
             return;
         }
 
@@ -493,7 +510,43 @@ private:
                     "  final_pose: frame='%s', x=%.2f, y=%.2f, z=%.2f",
                     final_pose.header.frame_id.c_str(),
                     final_pose.pose.position.x, final_pose.pose.position.y, final_pose.pose.position.z);
-        rclcpp::shutdown(); // TEMPORARY: removed in Phase B point 3 (the mission, not one subtask, decides when to stop)
+
+        // Phase B point 3: a result only updates this subtask; the other subtasks keep running.
+        // The coordinator stops only when the whole mission is finished.
+        check_mission_finished();
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // End of the mission (Phase B, point 3)
+    // ---------------------------------------------------------------------------------------------
+
+    // Called each time a subtask reaches a final state. If every subtask is now final, the mission is over:
+    // log a summary (one line per subtask, then the counts) and stop the coordinator.
+    // This is the only place where the coordinator shuts itself down; individual callbacks never do.
+    void check_mission_finished()
+    {
+        if (mission_finished_ || subtasks_.empty())
+            return; // already reported, or nothing was queued
+        for (const auto &entry : subtasks_)
+            if (!is_final(entry.second.state))
+                return; // at least one subtask is still waiting or running: the mission goes on
+
+        mission_finished_ = true;
+        std::map<SubtaskState, int> counts; // number of subtasks per final state
+        RCLCPP_INFO(this->get_logger(), "Mission finished: %zu subtask(s)", subtasks_.size());
+        for (const auto &entry : subtasks_)
+        {
+            const SubtaskRecord &record = entry.second;
+            counts[record.state] += 1;
+            RCLCPP_INFO(this->get_logger(), "  %s: %s", label(record).c_str(), to_string(record.state));
+        }
+        RCLCPP_INFO(this->get_logger(), "  succeeded=%d, aborted=%d, canceled=%d, rejected=%d",
+                    counts[SubtaskState::SUCCEEDED], counts[SubtaskState::ABORTED],
+                    counts[SubtaskState::CANCELED], counts[SubtaskState::REJECTED]);
+
+        // Stop spinning: rclcpp::spin() in main() returns. Later, a coordinator serving several missions
+        // would keep running instead.
+        rclcpp::shutdown();
     }
 
     // converts a real duration (as measured or reported by the robots) to nominal seconds, for the logs
@@ -507,6 +560,7 @@ private:
     // All subtasks known to the coordinator, one record each, indexed by (mission_id, subtask_id).
     // Only accessed from this node's callbacks, which run one at a time (single-threaded executor), so no lock is needed.
     std::map<SubtaskKey, SubtaskRecord> subtasks_;
+    bool mission_finished_ = false; // set once every subtask is final, so the summary is logged only once
 
     rclcpp::TimerBase::SharedPtr dispatch_timer_;     // periodic check that sends queued subtasks (see constructor)
     static constexpr double kWaitingWarningSec = 2.0; // real seconds before warning that a robot is not available
@@ -516,7 +570,11 @@ int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = std::make_shared<CoordinatorActionClientNode>(); // MODIFY NAME
-    node->send_goal("mission1", "subtask1", "navigate", geometry_msgs::msg::PoseStamped(), 30.0);
+
+    // queue subtask1 ... subtaskN of mission1 (N = subtask_count, at least 1); later the workflow provides the mission
+    const int subtask_count = std::max<int>(1, static_cast<int>(node->get_parameter("subtask_count").as_int()));
+    for (int i = 1; i <= subtask_count; ++i)
+        node->send_goal("mission1", "subtask" + std::to_string(i), "navigate", geometry_msgs::msg::PoseStamped(), 30.0);
 
     // Single-threaded on purpose: all the coordinator's callbacks (goal response, feedback, result,
     // cancel timer, cancel response) run one at a time, so its state (the subtask records, and later the
