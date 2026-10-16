@@ -184,7 +184,7 @@ src/
 | File | Purpose |
 |---|---|
 | `README.md` | This file: project overview, layout, build and run instructions. |
-| `TESTING.md` | Manual tests for the mock robot server: build, commands to type and expected results for each accept, reject, cancel and retry case. |
+| `TESTING.md` | Manual tests with the commands to type and the expected results: the mock robot alone (accept, reject, cancel, retry), the coordinator client (deviations, cancel, robot not available), the robot parameters (speed, time scale, name, namespace) and the fleet launch file. |
 | `.gitignore` | Keeps colcon output (`build/`, `install/`, `log/`) and Python caches out of the repository. |
 | `.vscode/c_cpp_properties.json` | VS Code IntelliSense configuration with the ROS 2 Humble include paths, so the editor can resolve `rclcpp` and the generated interface headers. |
 | `.claude/settings.json` | Claude Code project settings: no AI attribution in commits, and a confirmation prompt before every `git commit` and `git push`. |
