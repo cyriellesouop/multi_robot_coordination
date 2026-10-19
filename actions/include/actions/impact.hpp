@@ -188,7 +188,7 @@ struct ImpactAnalysis
   // A repair can only PREVENT the failure when time is left before its first consequence.
   // B_i = 0 means the threatened condition has already been reached: DWAFP may hold the affected
   // tasks and escalate, but the outcome must not be counted as a prevented failure.
-  // (C3 additionally requires T_decision + T_dispatch + T_restoration(pi) <= B_i.)
+  // (C3 checks the time a repair needs by including its dispatch latency in the prediction.)
   bool preventable() const {return needs_repair() && response_window_ms > 0;}
 };
 
@@ -203,16 +203,21 @@ struct ImpactAnalysis
 //               by this deviation and are not counted.
 //   V_R^(0)   = sources u A_i u every subtask on a path of the combined graph from a source to a
 //               subtask of A_i; completed subtasks are left out (they cannot be edited)
-//   t_j^viol  = violation time: when a violated condition actually happens:
-//               deadline threat                                  -> d_j
-//               missing input / infeasible assignment, unstarted -> its expected start s_ref
-//                                                                   (when it needs input / robot)
+//   t_j^viol  = violation time: the last moment at which the violated condition can still be
+//               protected:
+//               deadline threat                                  -> d_j (done by then)
+//               missing input / infeasible assignment, unstarted -> latest start
+//                                                   l_j = d_j - p_{j,alpha_j} (input / robot
+//                                                   there by then, on its current robot)
 //               missing output / infeasible assignment of the executing source -> already
 //               realized, does not set the window (otherwise a robot breakdown would always give
-//               B_i = 0; the next task's expected start is what counts)
+//               B_i = 0; the next task's latest start is what counts)
+//               With the latest start, B_i = 0 means the failure is certain, whatever the repair
+//               on the current assignment, instead of "the input is late for the planned start".
 //   B_i       = max(0, min t_j^viol - t_detect), kUnreachable when A_i is empty.
-//               Examples: deadline 6 s at t = 4 s -> 2 s; T1 fails at 3 s, T2 needs it at 5 s
-//               -> 2 s; robot breaks down at 2 s, its next task starts at 5 s -> 3 s.
+//               Examples: deadline 6 s at t = 4 s -> 2 s; T1 fails at 3 s, T2 (d 14 s, 7.5 s)
+//               needs it by 6.5 s -> 3.5 s; robot1 breaks down at 2 s, its next task B (d 11 s,
+//               5 s) needs a robot by 6 s -> 4 s.
 // Throws std::invalid_argument if the two states are at different times or have different sizes.
 ImpactAnalysis analyze_impact(
   const Mission & mission, const Plan & plan, const RuntimeState & expected,

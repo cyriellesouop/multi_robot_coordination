@@ -471,6 +471,8 @@ TaskPrediction Predictor::predict_task(Index j, const Prediction & prediction) c
         // The t term keeps an unstarted task from being predicted to start in the past.
         // Fork-join test: s_hat(T3) = max{4 s, 0, f_hat(T1) = 9 s, f_hat(T2) = 7.5 s} = 9 s.
         TimeMs start = std::max(now, robot.available_from_ms);
+        // A repaired task cannot start before its repair has been decided and dispatched.
+        start = std::max(start, task.release_ms);
         for (const Index h : mission_.dependency_predecessors(j)) {
           start = std::max(start, prediction.tasks[h].finish_ms);
         }

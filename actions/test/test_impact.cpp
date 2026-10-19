@@ -358,8 +358,8 @@ TEST(ImpactAnalysis, RegionIncludesConnectingPathButNotOtherAncestors)
 // Outcome failure: T1 fails at 3 s (it was expected to end at 5 s).
 //   A_i = {T2}: its outcome is newly violated (its deadline would still hold: 3-10.5 s).
 //   T1 is a realized failure, not a threat, but it is a source, so it is in the region.
-//   T2 would have needed its input at its expected start 5 s -> B_i = 5 - 3 = 2 s.
-TEST(ImpactAnalysis, OutcomeFailureWindowEndsAtTheSuccessorsExpectedStart)
+//   T2 (d 14 s, 7.5 s on robot2) needs its input by its latest start 6.5 s -> B_i = 3.5 s.
+TEST(ImpactAnalysis, OutcomeFailureWindowEndsAtTheSuccessorsLatestStart)
 {
   const Mission m = load("chain.yaml");
   const Plan plan = Plan::initial(m);
@@ -377,8 +377,8 @@ TEST(ImpactAnalysis, OutcomeFailureWindowEndsAtTheSuccessorsExpectedStart)
   EXPECT_TRUE(a.threats[0].outcome);
   EXPECT_FALSE(a.threats[0].deadline);
   EXPECT_EQ(names(m, a.region), (Names{"T1", "T2"}));
-  EXPECT_EQ(a.earliest_violation_ms, 5000);
-  EXPECT_EQ(a.response_window_ms, 2000);
+  EXPECT_EQ(a.earliest_violation_ms, 6500);  // 14 s - 7.5 s
+  EXPECT_EQ(a.response_window_ms, 3500);
 }
 
 // Failure observed AFTER the nominal completion: T1 (reference 0-5 s) fails at 7 s.
@@ -388,7 +388,8 @@ TEST(ImpactAnalysis, OutcomeFailureWindowEndsAtTheSuccessorsExpectedStart)
 //   T2's outcome : expected ok -> missing                          -> NEW outcome threat
 // (With "T1 executing, 0 s left", T2 would start at 7 s in the expected state too, its deadline
 // would look already missed, and the deadline threat caused by T1 would be lost.)
-// T2 needed its input at 5 s, already past: B_i = 0 (act immediately).
+// T2 needed its input by its latest start 6.5 s (14 - 7.5), already past at 7 s: B_i = 0. Even an
+// instant repair could not save T2's deadline any more: the failure is certain.
 TEST(ImpactAnalysis, FailureAfterNominalCompletionKeepsTheFullImpact)
 {
   const Mission m = load("chain.yaml");
@@ -413,7 +414,7 @@ TEST(ImpactAnalysis, FailureAfterNominalCompletionKeepsTheFullImpact)
   ASSERT_EQ(a.threats.size(), 1u);
   EXPECT_TRUE(a.threats[0].deadline);
   EXPECT_TRUE(a.threats[0].outcome);
-  EXPECT_EQ(a.earliest_violation_ms, 5000);
+  EXPECT_EQ(a.earliest_violation_ms, 6500);
   EXPECT_EQ(a.response_window_ms, 0);
   EXPECT_TRUE(a.needs_repair());
   EXPECT_FALSE(a.preventable());    // already due: hold and escalate, not a prevented failure
@@ -440,10 +441,10 @@ TEST(ImpactAnalysis, DelayObservedAfterNominalCompletionThreatensSourceAndSucces
 // Robot unavailability: robot1 (queue A, B) breaks down at 2 s. robot2 runs D then C (C needs B).
 //   Sources = {A, B}: their robot's entry changed (found automatically).
 //   A (executing): output and assignment lost -> threat, but already realized: no window.
-//   B (unstarted): unreachable -> deadline, output, assignment; needed at its expected start 5 s.
-//   C: waits for B -> deadline and output; expected start 10 s.
+//   B (unstarted): unreachable -> deadline, output, assignment; latest start 11 - 5 = 6 s.
+//   C: waits for B -> deadline and output; latest start 20 - 7.5 = 12.5 s.
 //   D: other robot, independent -> unaffected, not in the region.
-//   B_i = 5 s - 2 s = 3 s.
+//   B_i = 6 s - 2 s = 4 s.
 TEST(ImpactAnalysis, RobotUnavailabilityThreatensItsQueueAndDependents)
 {
   const Mission m = inline_mission(
@@ -467,10 +468,10 @@ TEST(ImpactAnalysis, RobotUnavailabilityThreatensItsQueueAndDependents)
   EXPECT_EQ(names(m, a.sources), (Names{"A", "B"}));
   EXPECT_EQ(names(m, a.threatened), (Names{"A", "B", "C"}));
   EXPECT_EQ(a.threats[0].violation_ms, dwafp::kUnreachable);  // A: already realized
-  EXPECT_EQ(a.threats[1].violation_ms, 5000);                 // B: expected start
-  EXPECT_EQ(a.threats[2].violation_ms, 10000);                // C: expected start
+  EXPECT_EQ(a.threats[1].violation_ms, 6000);                 // B: latest start on robot1
+  EXPECT_EQ(a.threats[2].violation_ms, 12500);                // C: latest start on robot2
   EXPECT_EQ(names(m, a.region), (Names{"A", "B", "C"}));
-  EXPECT_EQ(a.response_window_ms, 3000);
+  EXPECT_EQ(a.response_window_ms, 4000);
 }
 
 // With max_region_size = 1, the chain delay (region of 2 subtasks) is flagged as not local.

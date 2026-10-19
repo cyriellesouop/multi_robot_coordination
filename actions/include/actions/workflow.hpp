@@ -192,6 +192,19 @@ struct TaskRuntime
   TimeMs start_ms{0};      // executing / completed / failed: actual start time
   TimeMs remaining_ms{0};  // executing: the robot's estimate r_hat_j(t) of its remaining time
   TimeMs end_ms{0};        // completed: actual finish time; failed: failure time t_fail
+  // unstarted: earliest time the task may start, whatever else allows it (0 = no constraint).
+  // A repair sets it to t + T_decision + T_dispatch on the task it edits, so the dispatch latency
+  // is part of the prediction: it costs nothing when the task would wait for its inputs anyway,
+  // and it can make an upstream repair too late.
+  TimeMs release_ms{0};
+  // Whether the condition that made this attempt deviate or fail has cleared, so that the same
+  // robot could try again now (transient blockage). This is a RUNTIME property, different from
+  // Subtask::retryable (restarting is logically safe): a navigation task may be restartable, but
+  // retrying it while the same obstacle is still there gives the same failure. A persistent
+  // blockage is reported with false, which excludes same-robot retry (substitution or escalation
+  // remain). Default true: retryable blockages are assumed transient unless reported otherwise.
+  // The predictor does not read it; only the repair generation (repair.hpp) does.
+  bool retry_available{true};
 };
 
 // Runtime information of one robot.
@@ -295,7 +308,8 @@ struct Prediction
 //   executing : f = t + r_hat_j(t), y_local = 1
 //               (if its robot is unavailable: it stopped at t_u, so f = max(start, t_u),
 //                y_local = 0 and the assignment predicate is violated)
-//   unstarted : s = max{ t, a_alpha, f of every dependency predecessor, f of the queue predecessor }
+//   unstarted : s = max{ t, a_alpha, release_j, f of every dependency predecessor,
+//                        f of the queue predecessor }   (release_j: repair dispatch latency, 0 if none)
 //               f = s + p_{j,alpha}, y_local = 1
 //               (if its robot is unavailable: s = f = kUnreachable, y_local = 0 and the
 //                assignment predicate is violated: it can never run under this assignment)

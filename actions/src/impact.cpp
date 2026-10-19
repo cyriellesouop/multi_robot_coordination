@@ -21,7 +21,7 @@ namespace
 bool same(const TaskRuntime & a, const TaskRuntime & b)
 {
   return a.status == b.status && a.start_ms == b.start_ms && a.remaining_ms == b.remaining_ms &&
-         a.end_ms == b.end_ms;
+         a.end_ms == b.end_ms && a.release_ms == b.release_ms;
 }
 
 bool same(const RobotRuntime & a, const RobotRuntime & b)
@@ -295,14 +295,22 @@ ImpactAnalysis analyze_impact(
     threat.assignment = e.assignment_ok && !u.assignment_ok;
     if (!threat.deadline && !threat.outcome && !threat.assignment) {continue;}
 
-    // Violation time (input of the response window):
-    //   deadline                         -> d_j (the subtask is not done by then)
-    //   outcome / assignment, unstarted  -> its expected start (when it needs its input / robot)
+    // Violation time t_j^viol (input of the response window):
+    //   deadline                         -> d_j (the subtask must be done by then)
+    //   outcome / assignment, unstarted  -> its LATEST START l_j = d_j - p_{j,alpha_j}: the last
+    //                                       moment its input (or a robot) can be there without
+    //                                       making it miss its deadline. Before l_j, holding it
+    //                                       only uses slack; after l_j the failure is certain.
     //   outcome / assignment, executing  -> already realized: does not set the window
+    // Chain example: T1 fails at 3 s, T2 (d 14 s, 7.5 s on robot2) needs T1's output by 6.5 s.
     TimeMs violation = kUnreachable;
-    if (threat.deadline) {violation = std::min(violation, mission.task(j).deadline_ms);}
+    const TimeMs deadline = mission.task(j).deadline_ms;
+    if (threat.deadline) {violation = std::min(violation, deadline);}
     if ((threat.outcome || threat.assignment) && status == TaskStatus::kUnstarted) {
-      violation = std::min(violation, is_reachable(e.start_ms) ? e.start_ms : mission.task(j).deadline_ms);
+      // Duration on its CURRENT robot: the latest start of the task as planned. (A repair that
+      // moves it to a faster robot gives it more time; propagation accounts for that.)
+      const TimeMs latest_start = deadline - durations.at(j, plan.robot_of(j));
+      violation = std::min(violation, latest_start);
     }
     threat.violation_ms = violation;
     result.earliest_violation_ms = std::min(result.earliest_violation_ms, violation);
