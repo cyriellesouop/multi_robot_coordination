@@ -266,12 +266,16 @@ struct TaskPrediction
   bool outcome_ok{true};     // y_hat: true = the required output is predicted to exist
   bool deadline_ok{true};    // temporal predicate f_hat <= d
   bool assignment_ok{true};  // assignment-feasibility predicate: the assigned robot is available
+  // Held: unstarted and missing a mandatory input (y_hat = 0), so the execution engine will not
+  // dispatch it. Its own times stay finite (deadline analysis), but its robot cannot get past it
+  // in its fixed queue: the next task of that queue is predicted unreachable ("stalled").
+  bool held{false};
 
   bool operator==(const TaskPrediction & other) const
   {
     return start_ms == other.start_ms && finish_ms == other.finish_ms &&
            outcome_ok == other.outcome_ok && deadline_ok == other.deadline_ok &&
-           assignment_ok == other.assignment_ok;
+           assignment_ok == other.assignment_ok && held == other.held;
   }
   bool operator!=(const TaskPrediction & other) const {return !(*this == other);}
 };
@@ -300,6 +304,9 @@ struct Prediction
 // while y = 0 marks the tasks that miss a mandatory output and must not be dispatched.
 // An unreachable predecessor (dependency or queue) makes its successors unreachable too: the
 // input never arrives, or the robot never gets past it in its fixed queue.
+// Held tasks (unstarted with y = 0) are never dispatched, so their QUEUE successor is stalled:
+// its start is kUnreachable. Their DEPENDENCY successors keep finite times (y = 0 already
+// marks them), as required for deadline analysis.
 //
 // The Predictor keeps REFERENCES to its arguments: they must outlive it and stay unchanged.
 class Predictor

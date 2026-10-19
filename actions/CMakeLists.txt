@@ -20,6 +20,7 @@ find_package(yaml-cpp REQUIRED)  # mission / fleet YAML loading of the DWAFP lib
 add_library(dwafp_core STATIC
   src/workflow.cpp
   src/mission_loader.cpp
+  src/impact.cpp  # C2: deviation trigger, expected state, impact analysis
 )
 target_include_directories(dwafp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -54,6 +55,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_workflow dwafp_core)
   # The tests load the real config files (fleet + missions) from the source tree.
   target_compile_definitions(test_workflow PRIVATE
+    ACTIONS_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/config")
+
+  # C2: trigger and impact analysis, same config files.
+  ament_add_gtest(test_impact test/test_impact.cpp)
+  target_link_libraries(test_impact dwafp_core)
+  target_compile_definitions(test_impact PRIVATE
     ACTIONS_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/config")
 endif()
 

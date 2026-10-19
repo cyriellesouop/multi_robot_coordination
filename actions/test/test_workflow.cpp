@@ -162,7 +162,8 @@ void PrintTo(const TaskPrediction & p, std::ostream * os)
   const auto time = [](TimeMs t) {return is_reachable(t) ? std::to_string(t) : std::string("never");};
   *os << "{start " << time(p.start_ms) << ", finish " << time(p.finish_ms) << ", outcome "
       << (p.outcome_ok ? "ok" : "MISSING") << ", deadline " << (p.deadline_ok ? "ok" : "MISSED")
-      << ", assignment " << (p.assignment_ok ? "ok" : "INFEASIBLE") << "}";
+      << ", assignment " << (p.assignment_ok ? "ok" : "INFEASIBLE")
+      << (p.held ? ", HELD" : "") << "}";
 }
 }  // namespace dwafp
 
@@ -524,6 +525,46 @@ TEST(QueueEdges, FailedTaskFreesItsRobotWithoutRemovingTheNextTasksOutput)
   // Queue edges carry timing only: B starts when A failed, and keeps its own output.
   EXPECT_EQ(pr.tasks[m.task_index("B")], (dwafp::TaskPrediction{3000, 8000, true, true}));
   EXPECT_TRUE(dwafp::threatened_tasks(s, pr).empty());
+}
+
+// Stall rule. robot2 queue: T2 (needs T1's output) then E (independent of everything).
+// T1 fails at 3 s, so T2 misses its input and is HELD: it will not be dispatched. Its own times
+// stay finite (3 - 10.5 s), but robot2 cannot get past it in its fixed queue, so E, although it
+// needs nothing from T1, is stalled: unreachable, deadline failed, threatened.
+//   robot1:  T1 (fails)
+//              | dependency
+//   robot2:  T2 (held) ----queue----> E (stalled)
+TEST(QueueEdges, HeldTaskStallsTheRestOfItsQueue)
+{
+  const Mission m = inline_mission(
+    "{mission_id: stall, subtasks: ["
+    " {id: T1, robot: robot1, deadline_sec: 6},"
+    " {id: T2, robot: robot2, deadline_sec: 14, predecessors: [T1]},"
+    " {id: E, robot: robot2, deadline_sec: 30}]}");
+  const Plan plan = Plan::initial(m);
+  RuntimeState before = RuntimeState::initial(m);
+  before.now_ms = 3000;
+  set_executing(m, before, "T1", 0, 2000);
+  const DurationSnapshot p = durations(m, before);
+  const Prediction baseline = Predictor(m, plan, before, p).full();
+  EXPECT_EQ(baseline.tasks[m.task_index("E")].finish_ms, 20000);  // nominal: after T2 (12.5 s)
+
+  RuntimeState after = before;
+  set_finished(m, after, "T1", TaskStatus::kFailed, 0, 3000);
+  const std::vector<Index> horizon =
+    incremental_matches_full(m, plan, after, p, baseline, {m.task_index("T1")});
+  EXPECT_EQ(names(m, horizon), (std::vector<std::string>{"T1", "T2", "E"}));
+
+  const Prediction pr = Predictor(m, plan, after, p).full();
+  const dwafp::TaskPrediction t2 = pr.tasks[m.task_index("T2")];
+  const dwafp::TaskPrediction e = pr.tasks[m.task_index("E")];
+  EXPECT_TRUE(t2.held);                       // missing input: not dispatched
+  EXPECT_EQ(t2.finish_ms, 10500);             // but its own times stay finite
+  EXPECT_FALSE(dwafp::is_reachable(e.start_ms));  // robot2 is stuck behind T2
+  EXPECT_FALSE(e.deadline_ok);
+  EXPECT_TRUE(e.outcome_ok);                  // E's own output is not in question...
+  EXPECT_FALSE(e.held);                       // ...and E is not held, only stalled
+  EXPECT_EQ(names(m, dwafp::threatened_tasks(after, pr)), (std::vector<std::string>{"T2", "E"}));
 }
 
 // Robot-unavailability failure: robot1 breaks down at t = 2 s.

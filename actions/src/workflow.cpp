@@ -475,7 +475,17 @@ TaskPrediction Predictor::predict_task(Index j, const Prediction & prediction) c
           start = std::max(start, prediction.tasks[h].finish_ms);
         }
         const Index prev = plan_.queue_predecessor(j);
-        if (prev != kNoIndex) {start = std::max(start, prediction.tasks[prev].finish_ms);}
+        if (prev != kNoIndex) {
+          // The previous task of the robot's queue is held (missing input, never dispatched):
+          // the robot is stuck behind it, so j cannot start under this plan ("stalled").
+          // Only the held flag of the predecessor's PREDICTION is read, so incremental
+          // propagation stays exact (a change of it always re-enqueues j).
+          if (prediction.tasks[prev].held) {
+            start = kUnreachable;
+          } else {
+            start = std::max(start, prediction.tasks[prev].finish_ms);
+          }
+        }
         // If a predecessor is unreachable, max() above already made start = kUnreachable: the
         // input never arrives, or the robot never gets past the previous task of its queue.
         out.start_ms = start;
@@ -496,6 +506,9 @@ TaskPrediction Predictor::predict_task(Index j, const Prediction & prediction) c
     outcome_ok = outcome_ok && prediction.tasks[h].outcome_ok;
   }
   out.outcome_ok = outcome_ok;
+  // An unstarted task that will miss a mandatory output is held by the execution engine (the
+  // hold guard): it is not dispatched until a repair restores its inputs.
+  out.held = task.status == TaskStatus::kUnstarted && !outcome_ok;
   // Temporal predicate: f_hat <= d. Fork-join: T3 13 s <= 14 s -> holds; T1 9 s > 6 s -> fails.
   // kUnreachable is larger than any deadline, so an unreachable task always fails it.
   out.deadline_ok = out.finish_ms <= mission_.task(j).deadline_ms;
