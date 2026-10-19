@@ -153,13 +153,16 @@ std::vector<Index> incremental_matches_full(
 }  // namespace
 
 // gtest prints a TaskPrediction when EXPECT_EQ fails (otherwise it prints raw bytes).
-// Example of a failure message: {start 9000, finish 13000, outcome ok, deadline ok}.
+// Example of a failure message: {start 9000, finish 13000, outcome ok, deadline ok, assignment ok}.
+// kUnreachable is printed as "never" instead of a 19-digit number.
 namespace dwafp
 {
 void PrintTo(const TaskPrediction & p, std::ostream * os)
 {
-  *os << "{start " << p.start_ms << ", finish " << p.finish_ms << ", outcome "
-      << (p.outcome_ok ? "ok" : "MISSING") << ", deadline " << (p.deadline_ok ? "ok" : "MISSED") << "}";
+  const auto time = [](TimeMs t) {return is_reachable(t) ? std::to_string(t) : std::string("never");};
+  *os << "{start " << time(p.start_ms) << ", finish " << time(p.finish_ms) << ", outcome "
+      << (p.outcome_ok ? "ok" : "MISSING") << ", deadline " << (p.deadline_ok ? "ok" : "MISSED")
+      << ", assignment " << (p.assignment_ok ? "ok" : "INFEASIBLE") << "}";
 }
 }  // namespace dwafp
 
@@ -524,9 +527,12 @@ TEST(QueueEdges, FailedTaskFreesItsRobotWithoutRemovingTheNextTasksOutput)
 }
 
 // Robot-unavailability failure: robot1 breaks down at t = 2 s.
-//   A (running on robot1)  -> treated as failed at 2 s, no output
-//   B (queued on robot1)   -> cannot run there, no output
-//   C (needs B's output)   -> no output, by propagation along the dependency B -> C
+//   A (running on robot1)  -> stopped at 2 s (a real, finite time), no output, assignment infeasible
+//   B (queued on robot1)   -> NEVER runs under this assignment: start = finish = kUnreachable,
+//                             no output, assignment infeasible, deadline failed
+//                             (with a zero duration it would wrongly "finish" at 2 s and meet it)
+//   C (needs B's output)   -> unreachable too (its input never arrives), no output; its own
+//                             assignment (robot2) is fine
 //   D (robot2, independent) -> unaffected
 TEST(RobotUnavailability, RunningAndQueuedTasksLoseTheirOutputs)
 {
@@ -548,12 +554,58 @@ TEST(RobotUnavailability, RunningAndQueuedTasksLoseTheirOutputs)
   EXPECT_EQ(names(m, horizon), (std::vector<std::string>{"A", "B", "C"}));
 
   const Prediction pr = Predictor(m, plan, after, p).full();
-  EXPECT_EQ(pr.tasks[m.task_index("A")].finish_ms, 2000);  // treated as failed at t_u
-  EXPECT_FALSE(pr.tasks[m.task_index("A")].outcome_ok);
-  EXPECT_FALSE(pr.tasks[m.task_index("B")].outcome_ok);    // cannot run on robot1
-  EXPECT_FALSE(pr.tasks[m.task_index("C")].outcome_ok);    // its input B is missing
-  EXPECT_TRUE(pr.tasks[m.task_index("D")].outcome_ok);     // other robot, unaffected
+  const dwafp::TaskPrediction a = pr.tasks[m.task_index("A")];
+  const dwafp::TaskPrediction b = pr.tasks[m.task_index("B")];
+  const dwafp::TaskPrediction c = pr.tasks[m.task_index("C")];
+  EXPECT_EQ(a.finish_ms, 2000);           // stopped at t_u: in the past, so finite
+  EXPECT_FALSE(a.outcome_ok);
+  EXPECT_FALSE(a.assignment_ok);          // robot1 cannot continue it
+
+  EXPECT_EQ(b.start_ms, dwafp::kUnreachable);   // never starts on robot1...
+  EXPECT_EQ(b.finish_ms, dwafp::kUnreachable);  // ...so never finishes: no zero-duration "finish"
+  EXPECT_FALSE(b.deadline_ok);            // cannot falsely meet its 11 s deadline
+  EXPECT_FALSE(b.outcome_ok);
+  EXPECT_FALSE(b.assignment_ok);
+
+  EXPECT_FALSE(dwafp::is_reachable(c.finish_ms));  // waits for B, so unreachable too
+  EXPECT_FALSE(c.outcome_ok);             // its input B is missing
+  EXPECT_FALSE(c.deadline_ok);
+  EXPECT_TRUE(c.assignment_ok);           // robot2 itself is fine: a repair of B can restore C
+
+  EXPECT_EQ(pr.tasks[m.task_index("D")], baseline.tasks[m.task_index("D")]);  // unaffected
   EXPECT_EQ(names(m, dwafp::threatened_tasks(after, pr)), (std::vector<std::string>{"A", "B", "C"}));
+}
+
+// Same breakdown, then a plan edit moves B to robot3 (a substitution, as a C3 candidate will do).
+// B gets finite times again on its new robot, and so does C, which waits for B:
+//   B on robot3: 2 - 6 s (4 s on robot3), output ok, assignment ok, deadline 11 s ok
+//   C on robot2: waits for B (6 s) and for D (7.5 s, previous task of robot2) -> 7.5 - 15 s
+// A is still a realized failure on the broken robot and stays threatened (it needs its own repair).
+TEST(RobotUnavailability, ReassignmentRestoresFiniteTimes)
+{
+  const Mission m = inline_mission(kQueueMission);
+  const Plan plan = Plan::initial(m);
+  RuntimeState s = RuntimeState::initial(m);
+  s.now_ms = 2000;
+  set_executing(m, s, "A", 0, 3000);
+  set_executing(m, s, "D", 0, 5500);
+  s.robots[m.robot_index("robot1")].available = false;
+  s.robots[m.robot_index("robot1")].unavailable_since_ms = 2000;
+  const DurationSnapshot p = durations(m, s);
+  const Prediction broken = Predictor(m, plan, s, p).full();  // B and C unreachable here
+
+  // New plan: robot1 [A], robot2 [D, C], robot3 [B].
+  const Index A = m.task_index("A"), B = m.task_index("B"), C = m.task_index("C"), D = m.task_index("D");
+  const Plan repaired = Plan::from_queues(m, {{A}, {D, C}, {B}});
+
+  // The edit changed B's robot (and B had no queue successor on robot1), so changed = {B}.
+  const std::vector<Index> horizon = incremental_matches_full(m, repaired, s, p, broken, {B});
+  EXPECT_EQ(names(m, horizon), (std::vector<std::string>{"B", "C"}));
+
+  const Prediction pr = Predictor(m, repaired, s, p).full();
+  EXPECT_EQ(pr.tasks[B], (dwafp::TaskPrediction{2000, 6000, true, true, true}));
+  EXPECT_EQ(pr.tasks[C], (dwafp::TaskPrediction{7500, 15000, true, true, true}));
+  EXPECT_EQ(names(m, dwafp::threatened_tasks(s, pr)), (std::vector<std::string>{"A"}));
 }
 
 // =============================================================================================

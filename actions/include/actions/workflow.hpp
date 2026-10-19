@@ -56,6 +56,16 @@ using Index = std::size_t;
 // "No task" marker, e.g. the queue predecessor of the first task in a robot queue.
 constexpr Index kNoIndex = std::numeric_limits<Index>::max();
 
+// "Never, under the current assignment": the predicted time of a subtask that cannot be executed
+// as planned (its robot is unavailable), and of everything that waits for it. It is larger than
+// any deadline, so the deadline predicate fails, and it stays unreachable through max() and
+// additions, so it never pulls later subtasks forward. Times become finite again only after a
+// plan edit (e.g. a reassignment) gives the subtask an available robot.
+constexpr TimeMs kUnreachable = std::numeric_limits<TimeMs>::max();
+
+// True for a real (finite) predicted time, false for kUnreachable.
+constexpr bool is_reachable(TimeMs t) {return t != kUnreachable;}
+
 // Target pose of a subtask. DWAFP never reasons about it: it is opaque metadata that the adapter
 // copies into the ExecuteSubtask goal. Navigation time, if any, is hidden inside p_jr.
 struct TargetPose
@@ -71,7 +81,7 @@ struct Subtask
 {
   std::string id;                         // unique name, e.g. "T1"
   std::string robot;                      // initial assignee (robot name)
-  double work{5.0};                       // amount of work; p_jr = work * rate_r (see ConfigDurationModel)
+  double work{5.0};                       // amount of work; p_jr = work * rate_r (see ConfigDurationModel) work is how big the subtask is,
   TimeMs deadline_ms{0};                  // absolute latest completion time from mission start
   std::vector<std::string> predecessors;  // mandatory dependency predecessors (E_D), by subtask id
   bool retryable{true};                   // true if the subtask may be safely restarted
@@ -243,19 +253,25 @@ private:
   std::vector<TimeMs> table_;  // row-major: table_[j * robot_count_ + r]
 };
 
-// Prediction for one subtask: predicted start s_hat, finish f_hat, outcome y_hat and the result of
-// its two mandatory predicates (temporal: f_hat <= d; outcome: y_hat = 1).
+// Prediction for one subtask: predicted start s_hat, finish f_hat (either may be kUnreachable),
+// outcome y_hat and the result of its three mandatory predicates:
+//   temporal   : f_hat <= d                     (false when f_hat is kUnreachable)
+//   outcome    : y_hat = 1                      (its required output is predicted to exist)
+//   assignment : its assigned robot can execute it (false for an unfinished subtask whose robot
+//                is unavailable; only a plan edit that moves it to an available robot restores it)
 struct TaskPrediction
 {
   TimeMs start_ms{0};
   TimeMs finish_ms{0};
-  bool outcome_ok{true};   // y_hat: true = the required output is predicted to exist
-  bool deadline_ok{true};  // temporal predicate f_hat <= d
+  bool outcome_ok{true};     // y_hat: true = the required output is predicted to exist
+  bool deadline_ok{true};    // temporal predicate f_hat <= d
+  bool assignment_ok{true};  // assignment-feasibility predicate: the assigned robot is available
 
   bool operator==(const TaskPrediction & other) const
   {
     return start_ms == other.start_ms && finish_ms == other.finish_ms &&
-           outcome_ok == other.outcome_ok && deadline_ok == other.deadline_ok;
+           outcome_ok == other.outcome_ok && deadline_ok == other.deadline_ok &&
+           assignment_ok == other.assignment_ok;
   }
   bool operator!=(const TaskPrediction & other) const {return !(*this == other);}
 };
@@ -273,13 +289,17 @@ struct Prediction
 //   completed : f = actual end,  y_local = 1
 //   failed    : f = t_fail,      y_local = 0
 //   executing : f = t + r_hat_j(t), y_local = 1
-//               (if its robot is unavailable: treated as failed at max(start, t_u))
+//               (if its robot is unavailable: it stopped at t_u, so f = max(start, t_u),
+//                y_local = 0 and the assignment predicate is violated)
 //   unstarted : s = max{ t, a_alpha, f of every dependency predecessor, f of the queue predecessor }
 //               f = s + p_{j,alpha}, y_local = 1
-//               (if its robot is unavailable: f = s and y_local = 0, it cannot run there)
+//               (if its robot is unavailable: s = f = kUnreachable, y_local = 0 and the
+//                assignment predicate is violated: it can never run under this assignment)
 //   y = y_local AND y of every DEPENDENCY predecessor (queue edges carry timing only).
 // A failed predecessor therefore keeps finite times downstream (deadline analysis still works)
 // while y = 0 marks the tasks that miss a mandatory output and must not be dispatched.
+// An unreachable predecessor (dependency or queue) makes its successors unreachable too: the
+// input never arrives, or the robot never gets past it in its fixed queue.
 //
 // The Predictor keeps REFERENCES to its arguments: they must outlive it and stay unchanged.
 class Predictor
@@ -320,7 +340,7 @@ private:
 };
 
 // Subtasks that are not finished (unstarted or executing) and have at least one threatened
-// mandatory predicate (deadline or outcome), in index order. Failed subtasks are not listed:
+// mandatory predicate (deadline, outcome or assignment), in index order. Failed subtasks are not listed:
 // they are realized failures (the source of the deviation), not predicted threats.
 std::vector<Index> threatened_tasks(const RuntimeState & state, const Prediction & prediction);
 

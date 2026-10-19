@@ -145,6 +145,7 @@ Mission::Mission(std::string id, std::vector<Subtask> subtasks, std::vector<Robo
     if (in_degree[j] == 0) {ready.push(j);}
   }
   std::size_t visited = 0;
+  //ready holds the subtasks that are ready: everything they wait for has already been placed in the order.
   while (!ready.empty()) {
     const Index h = ready.top();  // smallest ready index
     ready.pop();
@@ -442,14 +443,27 @@ TaskPrediction Predictor::predict_task(Index j, const Prediction & prediction) c
         // Fork-join test: at t = 4 s robot1 says "5 s left" for T1 -> f_hat(T1) = 9 s.
         out.finish_ms = now + task.remaining_ms;
       } else {
-        // Robot-unavailability failure: the running task is treated as failed when the robot
-        // became unavailable (never before it started).
+        // Robot-unavailability failure: the running task stopped when the robot became
+        // unavailable (never before it started). That time is real (it is in the past), so it
+        // stays finite, but the output is missing and its current assignment is infeasible.
         out.finish_ms = std::max(task.start_ms, robot.unavailable_since_ms);
         local_ok = false;
+        out.assignment_ok = false;
       }
       break;
 
     case TaskStatus::kUnstarted: {
+        if (!robot.available) {
+          // Its robot is unavailable: under this assignment the task never runs. It gets NO
+          // finite time (not "zero duration", which would wrongly meet its deadline and pull
+          // the next tasks of the queue forward), no output, and a violated assignment
+          // predicate. Only a plan edit moving it to an available robot makes it finite again.
+          out.start_ms = kUnreachable;
+          out.finish_ms = kUnreachable;
+          local_ok = false;
+          out.assignment_ok = false;
+          break;
+        }
         // s_hat = max{ t, a_r, f_hat of dependency predecessors, f_hat of the queue predecessor }.
         // A subtask can only start when ALL of these are true: it is not in the past (t), its
         // robot is free (a_r), all its inputs exist (dependency predecessors), and its robot has
@@ -462,15 +476,14 @@ TaskPrediction Predictor::predict_task(Index j, const Prediction & prediction) c
         }
         const Index prev = plan_.queue_predecessor(j);
         if (prev != kNoIndex) {start = std::max(start, prediction.tasks[prev].finish_ms);}
+        // If a predecessor is unreachable, max() above already made start = kUnreachable: the
+        // input never arrives, or the robot never gets past the previous task of its queue.
         out.start_ms = start;
-        if (robot.available) {
-          // f_hat = s_hat + p_{j, robot}. Fork-join: f_hat(T3) = 9 s + 4 s = 13 s.
-          out.finish_ms = start + durations_.at(j, r);
-        } else {
-          // The robot cannot run it: no work is done (f = s) and the output will be missing.
-          out.finish_ms = start;
-          local_ok = false;
-        }
+        // f_hat = s_hat + p_{j, robot}. Fork-join: f_hat(T3) = 9 s + 4 s = 13 s.
+        // Saturating addition: an unreachable start stays unreachable, and a sum that would
+        // overflow the integer type is treated as unreachable instead of wrapping to a negative.
+        const TimeMs p = durations_.at(j, r);
+        out.finish_ms = (!is_reachable(start) || p > kUnreachable - start) ? kUnreachable : start + p;
         break;
       }
   }
@@ -484,6 +497,7 @@ TaskPrediction Predictor::predict_task(Index j, const Prediction & prediction) c
   }
   out.outcome_ok = outcome_ok;
   // Temporal predicate: f_hat <= d. Fork-join: T3 13 s <= 14 s -> holds; T1 9 s > 6 s -> fails.
+  // kUnreachable is larger than any deadline, so an unreachable task always fails it.
   out.deadline_ok = out.finish_ms <= mission_.task(j).deadline_ms;
   return out;
 }
@@ -578,7 +592,8 @@ std::vector<Index> threatened_tasks(const RuntimeState & state, const Prediction
     // Only unfinished tasks can be threatened; completed / failed ones are already decided.
     if (status != TaskStatus::kUnstarted && status != TaskStatus::kExecuting) {continue;}
     const TaskPrediction & p = prediction.tasks[j];
-    if (!p.deadline_ok || !p.outcome_ok) {threatened.push_back(j);}
+    // Any of the three mandatory predicates failing makes the task threatened.
+    if (!p.deadline_ok || !p.outcome_ok || !p.assignment_ok) {threatened.push_back(j);}
   }
   return threatened;
 }
