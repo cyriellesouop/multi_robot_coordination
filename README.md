@@ -176,12 +176,22 @@ src/
     ├── CMakeLists.txt
     ├── package.xml
     ├── config/
-    │   └── mock_fleet.yaml
+    │   ├── mock_fleet.yaml
+    │   └── missions/
+    │       ├── chain.yaml
+    │       └── fork_join.yaml
+    ├── include/actions/
+    │   ├── workflow.hpp
+    │   └── mission_loader.hpp
     ├── launch/
     │   └── mock_fleet.launch.py
-    └── src/
-        ├── robot_action_server.cpp
-        └── coordinator_action_client.cpp
+    ├── src/
+    │   ├── robot_action_server.cpp
+    │   ├── coordinator_action_client.cpp
+    │   ├── workflow.cpp
+    │   └── mission_loader.cpp
+    └── test/
+        └── test_workflow.cpp
 ```
 
 ### Root files
@@ -224,10 +234,14 @@ Run `ros2 interface show multi_robot_interfaces/action/ExecuteSubtask` to see th
 |---|---|
 | `src/robot_action_server.cpp` | **Mock robot.** Action server `robot_action_server` on `execute_subtask`. Rejects a goal if `mission_id` or `subtask_id` is empty, if the task type is not `navigate` (the only task implemented so far), if `timeout_sec` is not greater than the 5 s it needs, if the same subtask already succeeded, or if it is busy with another subtask. Executes accepted goals in a separate thread: simulates navigation in 5 steps while publishing feedback (progress and estimated time to completion), and checks for cancellation and timeout at least every 0.1 s and once more after the last step. Parameters: `robot_name` (how the robot identifies itself in its feedback and logs; by default its namespace, e.g. `robot1` for `/robot1`; read-only), `step_duration_sec` (nominal duration of a step, default 1.0: the robot's speed, so robots can differ) and `time_scale` (speed-up of the whole experiment, default 1.0); the 5 s it needs, `simulated_delay_sec` and `timeout_sec` checks all follow them. A canceled or timed-out goal returns a partial result (times, recoveries, remaining distance, last pose). It uses a multi-threaded executor, and the thread running the goal is joined on shutdown (Ctrl+C aborts an active goal cleanly). Successful subtasks are remembered; failed or canceled ones can be retried. It can simulate a deviation: with the parameter `simulated_delay_sec` greater than 0, the robot gets blocked for that many nominal seconds at step `delay_at_step` (default 2), publishes `BLOCKED` feedback with a growing time estimate and one recovery, and still honours cancellation and timeout. See [TESTING.md](TESTING.md) for manual tests. |
 | `src/coordinator_action_client.cpp` | **Coordinator.** Action client node `coordinator_action_client`. Runs without a namespace and creates one action client per robot of the fleet (parameter `robots`, default `[robot1, robot2, robot3]`, the names used by `mock_fleet.launch.py`), each on the absolute action `/<robot>/execute_subtask`, so it can drive the whole fleet and several subtasks run in parallel on different robots. It queues its subtasks and sends each as soon as its robot's server is available: it never blocks waiting for a robot, it checks every 100 ms, and warns after 2 s if a robot is still missing (the other robots are not affected, and it stops cleanly with Ctrl+C while waiting). It keeps one record per subtask, indexed by mission and subtask id (robot, state, attempt number, goal handle, deadline, deviation flags, cancel state), so state is never shared between subtasks, and every callback carries the attempt it belongs to so a late answer from an old attempt is ignored. Logs name a subtask as `mission/subtask#attempt@robot`. The test mission is hard-coded: `navigate` subtasks `subtask1` ... of `mission1`, timeout 30 s each, one per robot in turn (`subtask_count` sets how many), logs whether the goal was accepted or rejected, then the final status and result fields. A result or a rejection only updates its own subtask; the coordinator stops by itself only when every subtask is in a final state, after logging a mission summary (one line per subtask and the counts). The parameter `subtask_count` (default 0 = one subtask per robot) sets the number of subtasks, assigned to the robots in turn. It computes, from each feedback message, the margin between the time left before the deadline and the time the robot still needs, and reports a deviation when it starts and when it ends (robot `BLOCKED`, margin negative = subtask at risk), not on every message; the per-feedback progress line is at debug level. With the parameter `time_scale` (same value as the robots') the scenario is given in nominal seconds and all times in its logs are nominal, so a run prints the same numbers at any speed. The deadline is currently the goal's own `timeout_sec`; it will come from the workflow model. With the parameter `cancel_after_sec` greater than 0 it sends a cancel request that many seconds after the goal and logs the robot's answer (accepted, rejected, unknown or already finished) and the `CANCELED` result; the default is 0, no cancel. It uses a single-threaded executor and never blocks in a callback. It can cancel one subtask without touching the others and reassign it to another robot as a new attempt (the building blocks of the repairs); it does not repair the workflow by itself yet. |
+| `include/actions/workflow.hpp`, `src/workflow.cpp` | **DWAFP workflow model** (`dwafp` namespace), a ROS-free C++ library (`dwafp_core`) that the nodes do not use yet. A `Mission` holds the subtasks (assignee, work, deadline, dependency predecessors, retryable, opaque target pose) and the robots (speed) and rejects unknown robots or predecessors and dependency cycles. A `Plan` holds one fixed queue per robot and the combined graph (dependency edges plus robot-queue edges) with its topological order; a plan whose queue order contradicts a dependency is rejected. A `RuntimeState` holds the status of every subtask (unstarted, executing, completed, failed) and of every robot (available or not). A `DurationModel` gives the duration p_jr of every subtask on every robot (`ConfigDurationModel`: work times the robot's speed), and a `DurationSnapshot` freezes these values. The `Predictor` computes, for every subtask, the predicted start and finish time and whether its output exists, and checks the deadline and outcome conditions: `full()` for the whole workflow, `incremental()` only along the edges where a prediction changes, returning the validation horizon (every subtask whose prediction changed). `threatened_tasks()` lists the unfinished subtasks that violate a condition. All times are integer nominal milliseconds from mission start. |
+| `include/actions/mission_loader.hpp`, `src/mission_loader.cpp` | Loads a `Mission` from a mission YAML file and the fleet file `config/mock_fleet.yaml` (robot speed from `step_duration_sec`), with an error message naming the file and the subtask for every mistake. |
+| `config/missions/chain.yaml`, `config/missions/fork_join.yaml` | The two reference missions: a chain (T1 then T2) and a fork-join (T1 and T2 in parallel, then T3). Deadlines are nominal seconds from mission start. |
+| `test/test_workflow.cpp` | 17 unit tests of the workflow library: loading and validation, nominal timing and injected delays on the chain and fork-join missions, queue edges, outcome failure, robot unavailability, and a randomized test (300 workflows) checking that `incremental()` always gives the same prediction as `full()`. |
 | `launch/mock_fleet.launch.py` | Starts one `robot_action_server` per robot of the fleet file, each in its own namespace (`/<name>`), with the same `time_scale`. Launch arguments: `time_scale` (default 1.0) and `fleet_config` (YAML file, default `config/mock_fleet.yaml`). It stops with an error if the file has no robots, a robot without a name, or a name used twice. |
-| `config/mock_fleet.yaml` | The mock fleet: one entry per robot with its `name` (namespace) and optionally `step_duration_sec` (speed), `simulated_delay_sec` and `delay_at_step`. Three robots with different speeds by default. All durations are nominal seconds. |
-| `CMakeLists.txt` | Builds and installs the `robot_action_server` and `coordinator_action_client` executables, and installs the `launch/` and `config/` folders. |
-| `package.xml` | Package manifest: depends on `rclcpp`, `rclcpp_action`, `multi_robot_interfaces`, `geometry_msgs` and `diagnostic_msgs`; the launch file also needs `launch`, `launch_ros` and `python3-yaml`. |
+| `config/mock_fleet.yaml` | The mock fleet: one entry per robot with its `name` (namespace) and optionally `step_duration_sec` (speed), `simulated_delay_sec` and `delay_at_step`. Three robots with different speeds by default. All durations are nominal seconds. The workflow library reads the same file for the robots' speeds. |
+| `CMakeLists.txt` | Builds the `dwafp_core` library and the `robot_action_server` and `coordinator_action_client` executables, installs the executables and the `launch/` and `config/` folders, and registers the `test_workflow` unit test. |
+| `package.xml` | Package manifest: depends on `rclcpp`, `rclcpp_action`, `multi_robot_interfaces`, `geometry_msgs`, `diagnostic_msgs` and `yaml-cpp`; the launch file also needs `launch`, `launch_ros` and `python3-yaml`; the unit tests need `ament_cmake_gtest`. |
 
 ## Build
 
@@ -242,6 +256,13 @@ source install/setup.bash
 ```
 
 Always run `colcon build` from the workspace root (`ros2_ws/`), not from `src/`.
+
+Run the unit tests of the workflow library (add `--event-handlers console_direct+` to `colcon test` to see each test):
+
+```bash
+colcon test --packages-select actions
+colcon test-result --test-result-base build/actions --verbose
+```
 
 ## Run
 
@@ -304,13 +325,17 @@ See [TESTING.md](TESTING.md) for the complete list of manual tests.
 - [x] `ExecuteSubtask` action interface
 - [x] Mock robot action server (first version)
 - [x] Coordinator action client (first version: sends one goal and logs the result)
-- [ ] Workflow model (subtask DAG and dependency conditions)
+- [x] Workflow model: subtask DAG, robot queues, runtime state, forward propagation of predicted times and outcomes, with unit tests (library only: the coordinator does not use it yet)
 - [ ] Deviation detection (first step done: the client reports the start and end of `BLOCKED` and of a negative margin; no workflow or impact analysis yet)
 - [ ] Impact analysis and local workflow repair
-- [ ] Unit and integration tests
+- [ ] Unit and integration tests (first step done: unit tests of the workflow library; none yet for the nodes)
 - [ ] Nova Carter robot server (Nav2)
 
 ## Changelog
+
+### 2026-10-19 - Add the DWAFP workflow model and its predictions
+- New ROS-free library `dwafp_core` in the `actions` package: a mission (subtasks, dependencies, robots), fixed robot queues with the combined dependency-and-queue graph, runtime state, a frozen duration table, and a predictor that gives the predicted start, finish and outcome of every subtask. `incremental()` recomputes only what a change affects and returns the validation horizon; missions load from YAML (`config/missions/chain.yaml`, `fork_join.yaml`). First step of the workflow model; the coordinator does not use it yet.
+- Build with `colcon build --packages-select actions`, then `colcon test --packages-select actions` (17 tests in `test/test_workflow.cpp`).
 
 ### 2026-10-15 - Run the mock robots and the coordinator on system time only
 - Both nodes refuse to start with `use_sim_time:=true`: they mix the node clock with wall-clock waits and timers, which agree only with system time; experiments are sped up with `time_scale` instead. The README's "Time source" section now states this choice.

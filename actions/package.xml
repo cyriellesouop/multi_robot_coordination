@@ -14,6 +14,8 @@
   <depend>multi_robot_interfaces</depend>
   <depend>geometry_msgs</depend>
   <depend>diagnostic_msgs</depend>
+  <!-- DWAFP library: reads the mission and fleet YAML files -->
+  <depend>yaml-cpp</depend>
 
   <!-- needed only to run launch/mock_fleet.launch.py -->
   <exec_depend>launch</exec_depend>
@@ -21,6 +23,8 @@
   <exec_depend>ament_index_python</exec_depend>
   <exec_depend>python3-yaml</exec_depend>
 
+  <!-- unit tests of the DWAFP library (test/test_workflow.cpp) -->
+  <test_depend>ament_cmake_gtest</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

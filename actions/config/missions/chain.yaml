@@ -1,0 +1,22 @@
+# Chain demo (advisor demo 1): T1 on robot1 produces what T2 on robot2 needs.
+#   T1 --> T2
+# Durations come from config/mock_fleet.yaml (p = work * step_duration_sec):
+#   T1 on robot1: 5 * 1.0 = 5 s    T2 on robot2: 5 * 1.5 = 7.5 s
+# Nominal schedule: T1 0-5 s, T2 5-12.5 s, so both deadlines hold with some slack.
+# Deadlines are absolute nominal seconds from mission start. Format: include/actions/mission_loader.hpp.
+
+mission_id: chain
+
+subtasks:
+  - id: T1
+    robot: robot1
+    work: 5
+    deadline_sec: 6.0      # 1 s of slack
+    target_pose: {frame_id: map, x: 2.0, y: 0.0, yaw: 0.0}
+
+  - id: T2
+    robot: robot2
+    work: 5
+    deadline_sec: 14.0     # 1.5 s of slack
+    predecessors: [T1]
+    target_pose: {frame_id: map, x: 4.0, y: 1.0, yaw: 0.0}

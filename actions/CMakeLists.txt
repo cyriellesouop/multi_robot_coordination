@@ -12,6 +12,20 @@ find_package(rclcpp_action REQUIRED)
 find_package(multi_robot_interfaces REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
+find_package(yaml-cpp REQUIRED)  # mission / fleet YAML loading of the DWAFP library
+
+# DWAFP core library (Phase C): ROS-free C++ (standard library + yaml-cpp for loading only), so the
+# same code is used by the unit tests, the discrete-event simulator and the ROS coordinator adapter.
+# Static: it is linked into this package's own executables and tests, nothing to install.
+add_library(dwafp_core STATIC
+  src/workflow.cpp
+  src/mission_loader.cpp
+)
+target_include_directories(dwafp_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+)
+target_compile_features(dwafp_core PUBLIC cxx_std_17)
+target_link_libraries(dwafp_core PRIVATE yaml-cpp)  # private: the headers do not expose yaml-cpp
 
 add_executable(robot_action_server src/robot_action_server.cpp)   
 ament_target_dependencies(robot_action_server rclcpp rclcpp_action multi_robot_interfaces geometry_msgs diagnostic_msgs)
@@ -32,5 +46,15 @@ install(DIRECTORY
   config
   DESTINATION share/${PROJECT_NAME}
 )
+
+# Unit tests of the DWAFP library, run with `colcon test --packages-select actions`.
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_workflow test/test_workflow.cpp)
+  target_link_libraries(test_workflow dwafp_core)
+  # The tests load the real config files (fleet + missions) from the source tree.
+  target_compile_definitions(test_workflow PRIVATE
+    ACTIONS_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/config")
+endif()
 
 ament_package()

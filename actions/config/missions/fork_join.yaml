@@ -1,0 +1,31 @@
+# Fork-join demo (advisor demo 2): two independent branches join in T3.
+#   T1 --\
+#         +--> T3
+#   T2 --/
+# Durations come from config/mock_fleet.yaml (p = work * step_duration_sec):
+#   T1 on robot1: 5 s    T2 on robot2: 7.5 s    T3 on robot3: 5 * 0.8 = 4 s
+# Nominal schedule: T1 0-5 s, T2 0-7.5 s, T3 7.5-11.5 s (T3 waits for the slower branch T2).
+# A delay in T1 must leave branch T2 untouched; T3 is threatened only if T1 ends after 10 s.
+# Deadlines are absolute nominal seconds from mission start. Format: include/actions/mission_loader.hpp.
+
+mission_id: fork_join
+
+subtasks:
+  - id: T1
+    robot: robot1
+    work: 5
+    deadline_sec: 6.0
+    target_pose: {frame_id: map, x: 2.0, y: 0.0, yaw: 0.0}
+
+  - id: T2
+    robot: robot2
+    work: 5
+    deadline_sec: 9.0
+    target_pose: {frame_id: map, x: 0.0, y: 3.0, yaw: 0.0}
+
+  - id: T3
+    robot: robot3
+    work: 5
+    deadline_sec: 14.0     # 2.5 s of slack after the nominal join
+    predecessors: [T1, T2]
+    target_pose: {frame_id: map, x: 3.0, y: 3.0, yaw: 0.0}
