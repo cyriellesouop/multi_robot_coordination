@@ -7,7 +7,8 @@
 
 #include "actions/repair.hpp"
 
-#include <algorithm>  // std::find, std::max
+#include <algorithm>  // std::find, std::max, std::min
+#include <chrono>     // timings reported by decide()
 #include <stdexcept>  // std::invalid_argument
 #include <tuple>      // std::tie (lexicographic comparison)
 
@@ -193,23 +194,40 @@ StageOneResult generate_single_edits(
     throw std::invalid_argument("repair: the impact analysis was made at another time");
   }
 
-  // Hold guard (Algorithm 1): threatened unstarted tasks are not dispatched during the search.
-  for (const Index j : impact.threatened) {
-    if (actual.tasks[j].status == TaskStatus::kUnstarted) {result.to_hold.push_back(j);}
-  }
+  // Hold guard (Algorithm 1): tasks whose input or robot is threatened are not dispatched.
+  result.to_hold = tasks_to_hold(impact, actual);
 
   const Context c{mission, incumbent, actual, durations, impact, config, result};
 
-  // Enumeration order = tie-break order: policy, then target (region order = topological), then
-  // robot index. The region already excludes completed tasks (constraint (ii)).
+  // Edit locations. DWAFP: the repair region. The ablation alternatives: only the deviating tasks
+  // (sources), or every unfinished task (global single-edit oracle). Completed tasks are never
+  // edited (constraint (ii)); every list is in topological order.
+  std::vector<Index> targets;
+  switch (config.scope) {
+    case RepairScope::kRegion:
+      targets = impact.region;
+      break;
+    case RepairScope::kSources:
+      for (const Index j : impact.sources) {
+        if (actual.tasks[j].status != TaskStatus::kCompleted) {targets.push_back(j);}
+      }
+      break;
+    case RepairScope::kAllUnfinished:
+      for (const Index j : incumbent.topological_order()) {
+        if (actual.tasks[j].status != TaskStatus::kCompleted) {targets.push_back(j);}
+      }
+      break;
+  }
+
+  // Enumeration order = tie-break order: policy, then target (topological), then robot index.
   // 1. Same-robot retry: a failed or running task that is restartable (retryable), on its
   // operational robot, when the triggering condition is transient or has cleared
-  // (retry_available). A persistent blockage therefore leaves only substitution or escalation.
-  for (const Index k : impact.region) {
+  // (same_robot_retry_feasible). A persistent blockage therefore leaves only substitution or escalation.
+  for (const Index k : targets) {
     const TaskStatus s = actual.tasks[k].status;
     const Index r = incumbent.robot_of(k);
     if (!mission.task(k).retryable) {continue;}
-    if (!actual.tasks[k].retry_available) {continue;}
+    if (!actual.tasks[k].same_robot_retry_feasible) {continue;}
     if (s != TaskStatus::kFailed && s != TaskStatus::kExecuting) {continue;}
     if (!actual.robots[r].available) {continue;}
     evaluate(c, RepairPolicy::kRetry, k, r, false);
@@ -218,7 +236,7 @@ StageOneResult generate_single_edits(
   // 2. Direct substitution / blocked-successor takeover: an unstarted task, or a retryable
   // running / failed one (it restarts), moved to another available robot. A busy robot receives
   // it in the next slot (after its current task); an idle one immediately.
-  for (const Index k : impact.region) {
+  for (const Index k : targets) {
     const TaskStatus s = actual.tasks[k].status;
     const bool movable = s == TaskStatus::kUnstarted ||
       ((s == TaskStatus::kExecuting || s == TaskStatus::kFailed) && mission.task(k).retryable);
@@ -241,9 +259,9 @@ StageOneResult generate_single_edits(
     }
   }
 
-  // B_i = 0: the threatened condition is already due. The candidates stay available (containment,
-  // escalation report), but none can be claimed as a prevented failure.
-  if (!impact.preventable()) {return result;}
+  // No gate on the incumbent window B_i^0: it uses the current robots' durations, and a candidate
+  // with a faster robot can be preventive even when B_i^0 = 0. Each candidate has already been
+  // judged by its own activation-aware propagation (R = 0).
 
   // BestLexicographic over the preventive candidates: smallest [R, D, C], first generated on ties.
   for (std::size_t i = 0; i < result.admissible.size(); ++i) {
@@ -261,6 +279,140 @@ StageOneResult generate_single_edits(
     }
   }
   return result;
+}
+
+std::vector<Index> tasks_to_hold(const ImpactAnalysis & impact, const RuntimeState & actual)
+{
+  std::vector<Index> hold;
+  for (const Threat & t : impact.threats) {
+    // Only an unstarted task can still be prevented from starting; only a missing input or an
+    // unusable robot makes starting INVALID (a deadline threat only makes it late).
+    if (actual.tasks[t.task].status != TaskStatus::kUnstarted) {continue;}
+    if (t.outcome || t.assignment) {hold.push_back(t.task);}
+  }
+  return hold;
+}
+
+std::vector<Index> unprotectable_threats(
+  const Mission & mission, const Plan & incumbent, const RuntimeState & actual,
+  const DurationSnapshot & durations, const ImpactAnalysis & impact, const RepairConfig & config)
+{
+  const std::size_t n = mission.task_count();
+  const TimeMs now = actual.now_ms;
+  const TimeMs release = now + config.decision_overhead_ms + config.dispatch_overhead_ms;
+
+  // Fastest duration of task j over the robots in `allowed` (kUnreachable if none is allowed).
+  const auto fastest = [&](Index j, auto allowed) {
+      TimeMs best = kUnreachable;
+      for (Index r = 0; r < mission.robot_count(); ++r) {
+        if (allowed(r)) {best = std::min(best, durations.at(j, r));}
+      }
+      return best;
+    };
+  // start + duration, staying kUnreachable when either part is.
+  const auto add = [](TimeMs start, TimeMs p) {
+      return (!is_reachable(start) || !is_reachable(p)) ? kUnreachable : start + p;
+    };
+
+  std::vector<TimeMs> lb_finish(n, kUnreachable);  // earliest possible finish
+  std::vector<bool> output_possible(n, false);     // can its output exist at all?
+
+  // Dependency predecessors come first in the incumbent's topological order (queue edges are
+  // ignored by the bound but do not break that property).
+  for (const Index j : incumbent.topological_order()) {
+    const TaskRuntime & task = actual.tasks[j];
+    const Index own = incumbent.robot_of(j);
+    const bool own_available = actual.robots[own].available;
+
+    // Inputs: the latest earliest-finish of the dependency predecessors, and whether they can all
+    // produce their outputs.
+    TimeMs inputs_ready = now;
+    bool inputs_possible = true;
+    for (const Index h : mission.dependency_predecessors(j)) {
+      inputs_ready = std::max(inputs_ready, lb_finish[h]);
+      inputs_possible = inputs_possible && output_possible[h];
+    }
+
+    // Restart (executing or failed task): a permitted robot, not before the release time.
+    const auto restart = [&]() {
+        if (!mission.task(j).retryable) {return kUnreachable;}
+        const TimeMs p = fastest(j, [&](Index r) {
+              if (!actual.robots[r].available) {return false;}
+              return r != own || task.same_robot_retry_feasible;  // own robot: retry rule
+            });
+        return add(std::max(release, inputs_ready), p);
+      };
+
+    switch (task.status) {
+      case TaskStatus::kCompleted:
+        lb_finish[j] = task.end_ms;
+        output_possible[j] = true;
+        break;
+      case TaskStatus::kExecuting: {
+          const TimeMs cont = own_available ? now + task.remaining_ms : kUnreachable;
+          lb_finish[j] = std::min(cont, restart());
+          output_possible[j] = is_reachable(lb_finish[j]);
+          break;
+        }
+      case TaskStatus::kFailed:
+        lb_finish[j] = restart();
+        output_possible[j] = is_reachable(lb_finish[j]);
+        break;
+      case TaskStatus::kUnstarted: {
+          const TimeMs p = fastest(j, [&](Index r) {return actual.robots[r].available;});
+          lb_finish[j] = add(inputs_ready, p);
+          output_possible[j] = is_reachable(lb_finish[j]);
+          break;
+        }
+    }
+    output_possible[j] = output_possible[j] && inputs_possible;
+  }
+
+  // A repair must restore EVERY predicate of every task of A_i (R = 0): its deadline and its
+  // output (the assignment predicate is restored as soon as a usable robot exists, which the
+  // reachable bound already requires).
+  std::vector<Index> unprotectable;
+  for (const Index j : impact.threatened) {
+    if (!output_possible[j] || lb_finish[j] > mission.task(j).deadline_ms) {
+      unprotectable.push_back(j);
+    }
+  }
+  return unprotectable;
+}
+
+Decision decide(
+  const Mission & mission, const Plan & incumbent, const RuntimeState & expected,
+  const RuntimeState & actual, const DurationSnapshot & durations, const RepairConfig & config)
+{
+  using Clock = std::chrono::steady_clock;
+  const auto us = [](Clock::time_point a, Clock::time_point b) {
+      return std::chrono::duration<double, std::micro>(b - a).count();
+    };
+  Decision d;
+
+  const auto t0 = Clock::now();
+  d.impact = analyze_impact(mission, incumbent, expected, actual, durations);
+  const auto t1 = Clock::now();
+  d.impact_us = us(t0, t1);
+  if (!d.impact.needs_repair()) {
+    d.status = DecisionStatus::kContinue;
+    return d;
+  }
+  d.to_hold = tasks_to_hold(d.impact, actual);
+
+  // LocalPreventionInfeasible: no search, no Stage II, hold and report.
+  d.unprotectable = unprotectable_threats(mission, incumbent, actual, durations, d.impact, config);
+  const auto t2 = Clock::now();
+  d.check_us = us(t1, t2);
+  if (!d.unprotectable.empty()) {
+    d.status = DecisionStatus::kNoFeasibleLocalRepair;
+    return d;
+  }
+
+  d.stage1 = generate_single_edits(mission, incumbent, actual, durations, d.impact, config);
+  d.stage1_us = us(t2, Clock::now());
+  d.status = d.stage1.best ? DecisionStatus::kRepair : DecisionStatus::kNoSingleEdit;
+  return d;
 }
 
 }  // namespace dwafp

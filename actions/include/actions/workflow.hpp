@@ -197,14 +197,17 @@ struct TaskRuntime
   // is part of the prediction: it costs nothing when the task would wait for its inputs anyway,
   // and it can make an upstream repair too late.
   TimeMs release_ms{0};
-  // Whether the condition that made this attempt deviate or fail has cleared, so that the same
-  // robot could try again now (transient blockage). This is a RUNTIME property, different from
-  // Subtask::retryable (restarting is logically safe): a navigation task may be restartable, but
-  // retrying it while the same obstacle is still there gives the same failure. A persistent
-  // blockage is reported with false, which excludes same-robot retry (substitution or escalation
-  // remain). Default true: retryable blockages are assumed transient unless reported otherwise.
+  // Whether the SAME robot could try this task again now: true when the cause of the deviation or
+  // failure is expected to clear (transient), false when it is expected to persist FOR THAT ROBOT
+  // (persistent). This is a RUNTIME property, different from Subtask::retryable (restarting is
+  // logically safe): a navigation task may be restartable, but retrying it while the same
+  // obstacle is still there gives the same failure. false excludes same-robot retry only:
+  // "persistent" does not mean the task is infeasible for every robot, and substitution remains
+  // possible where another robot can execute it. (A cause that blocks EVERY robot, e.g. a shared
+  // corridor, is not modelled by this flag: it would make every assignment of the task infeasible.)
+  // Default true: retryable deviations are assumed transient unless reported otherwise.
   // The predictor does not read it; only the repair generation (repair.hpp) does.
-  bool retry_available{true};
+  bool same_robot_retry_feasible{true};
 };
 
 // Runtime information of one robot.

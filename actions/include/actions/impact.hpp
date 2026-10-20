@@ -185,11 +185,12 @@ struct ImpactAnalysis
   // false: no condition is newly threatened, DWAFP continues and monitors (an event is not a repair)
   bool needs_repair() const {return !threatened.empty();}
 
-  // A repair can only PREVENT the failure when time is left before its first consequence.
-  // B_i = 0 means the threatened condition has already been reached: DWAFP may hold the affected
-  // tasks and escalate, but the outcome must not be counted as a prevented failure.
-  // (C3 checks the time a repair needs by including its dispatch latency in the prediction.)
-  bool preventable() const {return needs_repair() && response_window_ms > 0;}
+  // Incumbent response window B_i^0 > 0: the threatened conditions can still be protected under
+  // the CURRENT assignment (the latest starts use the incumbent robots' durations). It measures
+  // the urgency of the current workflow state. B_i^0 = 0 means they cannot be protected without
+  // changing the assignment; it is NOT a proof that no repair exists (a faster robot may still
+  // make it), so it never rejects a candidate: each candidate is judged by its own propagation.
+  bool incumbent_window_open() const {return needs_repair() && response_window_ms > 0;}
 };
 
 // AnalyzeImpact. `expected` and `actual` must describe the same time t (now_ms) and differ only
@@ -212,9 +213,10 @@ struct ImpactAnalysis
 //               missing output / infeasible assignment of the executing source -> already
 //               realized, does not set the window (otherwise a robot breakdown would always give
 //               B_i = 0; the next task's latest start is what counts)
-//               With the latest start, B_i = 0 means the failure is certain, whatever the repair
-//               on the current assignment, instead of "the input is late for the planned start".
-//   B_i       = max(0, min t_j^viol - t_detect), kUnreachable when A_i is empty.
+//               These are INCUMBENT values (t_j^viol,0, on the current assignment alpha^0).
+//   B_i       = incumbent response window B_i^0 = max(0, min t_j^viol,0 - t_detect),
+//               kUnreachable when A_i is empty. B_i^0 = 0 means the threatened conditions cannot
+//               be protected WITHOUT changing the assignment, not that no repair exists.
 //               Examples: deadline 6 s at t = 4 s -> 2 s; T1 fails at 3 s, T2 (d 14 s, 7.5 s)
 //               needs it by 6.5 s -> 3.5 s; robot1 breaks down at 2 s, its next task B (d 11 s,
 //               5 s) needs a robot by 6 s -> 4 s.

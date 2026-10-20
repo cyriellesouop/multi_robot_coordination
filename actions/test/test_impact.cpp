@@ -271,7 +271,7 @@ TEST(ImpactAnalysis, ChainDelayThreatensBothAndGivesTheWindow)
   EXPECT_EQ(a.earliest_violation_ms, 6000);
   EXPECT_EQ(a.response_window_ms, 2000);
   EXPECT_TRUE(a.needs_repair());
-  EXPECT_TRUE(a.preventable());     // 2 s left to protect the deadline
+  EXPECT_TRUE(a.incumbent_window_open());     // 2 s left to protect the deadline
   EXPECT_FALSE(a.region_too_large);
 }
 
@@ -291,7 +291,7 @@ TEST(ImpactAnalysis, AbsorbedDelayNeedsNoRepair)
   const ImpactAnalysis a = dwafp::analyze_impact(m, plan, expected, actual, p);
   EXPECT_EQ(names(m, a.horizon), (Names{"T1", "T2"}));
   EXPECT_FALSE(a.needs_repair());
-  EXPECT_FALSE(a.preventable());    // no threat: continue and monitor
+  EXPECT_FALSE(a.incumbent_window_open());    // no threat: continue and monitor
   EXPECT_TRUE(a.region.empty());
   EXPECT_EQ(a.response_window_ms, dwafp::kUnreachable);
 }
@@ -388,8 +388,9 @@ TEST(ImpactAnalysis, OutcomeFailureWindowEndsAtTheSuccessorsLatestStart)
 //   T2's outcome : expected ok -> missing                          -> NEW outcome threat
 // (With "T1 executing, 0 s left", T2 would start at 7 s in the expected state too, its deadline
 // would look already missed, and the deadline threat caused by T1 would be lost.)
-// T2 needed its input by its latest start 6.5 s (14 - 7.5), already past at 7 s: B_i = 0. Even an
-// instant repair could not save T2's deadline any more: the failure is certain.
+// T2 needed its input by its latest start 6.5 s (14 - 7.5), already past at 7 s: B_i^0 = 0. Under
+// the current assignment (T2 on robot2, 7.5 s) T2's deadline can no longer be met; only a repair
+// that changes the assignment could still save it.
 TEST(ImpactAnalysis, FailureAfterNominalCompletionKeepsTheFullImpact)
 {
   const Mission m = load("chain.yaml");
@@ -417,7 +418,7 @@ TEST(ImpactAnalysis, FailureAfterNominalCompletionKeepsTheFullImpact)
   EXPECT_EQ(a.earliest_violation_ms, 6500);
   EXPECT_EQ(a.response_window_ms, 0);
   EXPECT_TRUE(a.needs_repair());
-  EXPECT_FALSE(a.preventable());    // already due: hold and escalate, not a prevented failure
+  EXPECT_FALSE(a.incumbent_window_open());    // not protectable on the current assignment
 }
 
 // Delay observed late: at 7 s T1 is still running with 2 s left (ends 9 s; reference 5 s).

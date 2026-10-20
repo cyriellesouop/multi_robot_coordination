@@ -300,7 +300,8 @@ ImpactAnalysis analyze_impact(
     //   outcome / assignment, unstarted  -> its LATEST START l_j = d_j - p_{j,alpha_j}: the last
     //                                       moment its input (or a robot) can be there without
     //                                       making it miss its deadline. Before l_j, holding it
-    //                                       only uses slack; after l_j the failure is certain.
+    //                                       only uses slack; after l_j the CURRENT assignment can
+    //                                       no longer meet it (a faster robot still might).
     //   outcome / assignment, executing  -> already realized: does not set the window
     // Chain example: T1 fails at 3 s, T2 (d 14 s, 7.5 s on robot2) needs T1's output by 6.5 s.
     TimeMs violation = kUnreachable;

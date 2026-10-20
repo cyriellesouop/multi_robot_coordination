@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <random>
 #include <string>
 #include <vector>
 
@@ -146,7 +147,8 @@ TEST(StageOne, SubstitutionOfTheDownstreamTaskIsBest)
   ASSERT_EQ(e.impact.response_window_ms, 12000);
   EXPECT_EQ(e.stage1.generated, 5u);
   EXPECT_EQ(e.stage1.admissible.size(), 5u);
-  EXPECT_EQ(e.stage1.to_hold, (std::vector<Index>{m.task_index("T2")}));  // threatened, unstarted
+  // T2 is threatened only by its deadline: it would be late, not invalid, so it is not held.
+  EXPECT_TRUE(e.stage1.to_hold.empty());
 
   const RepairCandidate * retry = e.find(RepairPolicy::kRetry, "T1", "robot1");
   ASSERT_TRUE(retry);
@@ -302,7 +304,7 @@ RuntimeState blocked_at_1s(const Mission & m, bool transient)
   RuntimeState s = RuntimeState::initial(m);
   s.now_ms = 1000;
   set_executing(m, s, "T1", 0, 9000);
-  s.tasks[m.task_index("T1")].retry_available = transient;
+  s.tasks[m.task_index("T1")].same_robot_retry_feasible = transient;
   s.robots[m.robot_index("robot3")].available = false;
   return s;
 }
@@ -323,7 +325,7 @@ TEST(StageOne, RetryIsBestWhenItIsTheLeastDisruptive)
   e.expect_consistent();
 }
 
-// Same event, but the blockage is PERSISTENT (retry_available = false): retrying on robot1 would
+// Same event, but the blockage is PERSISTENT (same_robot_retry_feasible = false): retrying on robot1 would
 // meet the same obstacle, so retry is not generated. The remaining single edits all leave T2
 // late: no Stage I repair (Stage II or escalation).
 TEST(StageOne, PersistentBlockageExcludesRetry)
@@ -424,7 +426,7 @@ TEST(StageOne, NoIdleReplacementRobotRequiresEscalation)
   RuntimeState s = RuntimeState::initial(m);
   s.now_ms = 2000;
   set_executing(m, s, "T1", 0, 9000);
-  s.tasks[m.task_index("T1")].retry_available = false;  // persistent blockage
+  s.tasks[m.task_index("T1")].same_robot_retry_feasible = false;  // persistent blockage
   set_executing(m, s, "X", 0, 5500);
   set_executing(m, s, "Y", 0, 10000);
   const Event e(m, s, {"T1"});
@@ -440,6 +442,56 @@ TEST(StageOne, NoIdleReplacementRobotRequiresEscalation)
   e.expect_consistent();
 }
 
+// The incumbent window B_i^0 = 0 does not reject a feasible repair (colleague's example).
+//   robot1 queue: A (completed 0-5 s) then B (d 11 s, 5 s on robot1, 4 s on robot3)
+// robot1 broke down at 5 s, which is detected at t = 7 s; in the expected world B runs 5-10 s.
+// B's latest start on its CURRENT robot is 11 - 5 = 6 s, already past: B_i^0 = 0. But robot3,
+// idle, needs only 4 s: B -> robot3 runs 7-11 s and meets the deadline (R = 0), so it is the
+// best preventive repair. (B -> robot2 needs 7.5 s: 7-14.5 s, R = 1.)
+TEST(StageOne, IncumbentWindowZeroDoesNotRejectAFasterRobot)
+{
+  const Mission m = inline_mission(
+    "{mission_id: late, subtasks: ["
+    " {id: A, robot: robot1, deadline_sec: 6},"
+    " {id: B, robot: robot1, deadline_sec: 11}]}");
+  const Plan plan = Plan::initial(m);
+  const Index a = m.task_index("A");
+  const Index b = m.task_index("B");
+  const Index robot1 = m.robot_index("robot1");
+
+  RuntimeState actual = RuntimeState::initial(m);
+  actual.now_ms = 7000;
+  actual.tasks[a].status = TaskStatus::kCompleted;
+  actual.tasks[a].start_ms = 0;
+  actual.tasks[a].end_ms = 5000;
+  actual.robots[robot1].available = false;      // broke down at 5 s
+  actual.robots[robot1].unavailable_since_ms = 5000;
+
+  RuntimeState expected = actual;                // the world without the breakdown:
+  expected.robots[robot1].available = true;
+  expected.robots[robot1].unavailable_since_ms = 0;
+  expected.tasks[b].status = TaskStatus::kExecuting;  // B would be running since 5 s
+  expected.tasks[b].start_ms = 5000;
+  expected.tasks[b].remaining_ms = 3000;
+
+  const DurationSnapshot p = DurationSnapshot::capture(m, dwafp::ConfigDurationModel{}, actual);
+  const ImpactAnalysis impact = dwafp::analyze_impact(m, plan, expected, actual, p);
+  ASSERT_EQ(impact.threatened, (std::vector<Index>{b}));
+  EXPECT_EQ(impact.earliest_violation_ms, 6000);  // latest start on robot1
+  EXPECT_EQ(impact.response_window_ms, 0);        // B_i^0 = 0
+  EXPECT_FALSE(impact.incumbent_window_open());
+
+  const StageOneResult stage1 = dwafp::generate_single_edits(m, plan, actual, p, impact);
+  ASSERT_TRUE(stage1.best);
+  const RepairCandidate & best = stage1.admissible[*stage1.best];
+  EXPECT_EQ(best.policy, RepairPolicy::kSubstitution);
+  EXPECT_EQ(best.task, b);
+  EXPECT_EQ(best.robot, m.robot_index("robot3"));
+  EXPECT_EQ(best.prediction.tasks[b].start_ms, 7000);
+  EXPECT_EQ(best.prediction.tasks[b].finish_ms, 11000);  // exactly at the deadline
+  EXPECT_EQ(best.residual_risk, 0);
+}
+
 // A deviation absorbed by slack needs no repair: Stage I returns an empty result.
 TEST(StageOne, NoCandidatesWhenNothingIsThreatened)
 {
@@ -453,3 +505,201 @@ TEST(StageOne, NoCandidatesWhenNothingIsThreatened)
   EXPECT_TRUE(e.stage1.admissible.empty());
   EXPECT_FALSE(e.stage1.best);
 }
+
+// =============================================================================================
+// decide(): Algorithm 1 up to Stage I, with the LocalPreventionInfeasible certificate
+// =============================================================================================
+
+namespace
+{
+// Runs decide() for an observed state, rebuilding the expected state from the mission-start
+// reference like Event does.
+dwafp::Decision decide_event(
+  const Mission & m, const RuntimeState & actual, const std::vector<std::string> & deviating,
+  const dwafp::RepairConfig & config = {})
+{
+  const Plan plan = Plan::initial(m);
+  const DurationSnapshot p = DurationSnapshot::capture(m, dwafp::ConfigDurationModel{}, actual);
+  const RuntimeState s0 = RuntimeState::initial(m);
+  const Prediction reference = Predictor(m, plan, s0, p).full();
+  std::vector<Index> tasks;
+  for (const auto & id : deviating) {tasks.push_back(m.task_index(id));}
+  const RuntimeState expected = dwafp::expected_state(m, plan, actual, reference, tasks, {});
+  return dwafp::decide(m, plan, expected, actual, p, config);
+}
+}  // namespace
+
+// chain.yaml, T1 predicts 8 s at t = 4 s; its own deadline is 6 s. Lower bound for T1:
+// continue 8 s, or restart on the fastest robot (robot3, 4 s) from 4 s -> 8 s. 8 > 6 s: no
+// permitted local repair, single or double, can save T1's deadline. decide() says so WITHOUT
+// running the search. T2 (deadline-only threat) is not held: it may still run, late.
+TEST(Decide, NoFeasibleLocalRepairWhenTheSourceDeadlineIsProvablyLost)
+{
+  const Mission m = dwafp::load_mission(kConfigDir + "/missions/chain.yaml", kConfigDir + "/mock_fleet.yaml");
+  RuntimeState s = RuntimeState::initial(m);
+  s.now_ms = 4000;
+  set_executing(m, s, "T1", 0, 4000);
+  const dwafp::Decision d = decide_event(m, s, {"T1"});
+  EXPECT_EQ(d.status, dwafp::DecisionStatus::kNoFeasibleLocalRepair);
+  EXPECT_EQ(d.unprotectable, (std::vector<Index>{m.task_index("T1")}));
+  EXPECT_TRUE(d.to_hold.empty());
+  EXPECT_EQ(d.stage1.generated, 0u);  // the search was skipped
+}
+
+// Outcome failure of a task that may NOT be restarted (retryable: false): T2's input can never
+// exist, whatever the repair. T2 is unprotectable, and it is held (its input is missing).
+TEST(Decide, NoFeasibleLocalRepairWhenALostOutputCannotBeReproduced)
+{
+  const Mission m = inline_mission(
+    "{mission_id: lost, subtasks: [{id: T1, robot: robot1, deadline_sec: 15, retryable: false},"
+    " {id: T2, robot: robot2, deadline_sec: 25, predecessors: [T1]}]}");
+  RuntimeState s = RuntimeState::initial(m);
+  s.now_ms = 3000;
+  set_failed(m, s, "T1", 0, 3000);
+  const dwafp::Decision d = decide_event(m, s, {"T1"});
+  EXPECT_EQ(d.status, dwafp::DecisionStatus::kNoFeasibleLocalRepair);
+  EXPECT_EQ(d.unprotectable, (std::vector<Index>{m.task_index("T2")}));
+  EXPECT_EQ(d.to_hold, (std::vector<Index>{m.task_index("T2")}));
+}
+
+// The repairable chain of SubstitutionOfTheDownstreamTaskIsBest: the certificate finds nothing
+// unprotectable, the search runs and returns a repair.
+TEST(Decide, RepairWhenAPreventiveSingleEditExists)
+{
+  const Mission m = chain(20, 14);
+  RuntimeState s = RuntimeState::initial(m);
+  s.now_ms = 2000;
+  set_executing(m, s, "T1", 0, 6000);
+  const dwafp::Decision d = decide_event(m, s, {"T1"});
+  EXPECT_EQ(d.status, dwafp::DecisionStatus::kRepair);
+  EXPECT_TRUE(d.unprotectable.empty());
+  ASSERT_TRUE(d.stage1.best);
+  EXPECT_EQ(d.stage1.admissible[*d.stage1.best].task, m.task_index("T2"));
+}
+
+// The no-idle-robot case: the lower bound is optimistic (it ignores that robot3 is busy until
+// 12 s), so it cannot prove infeasibility; the search runs and finds no single edit: Stage II.
+TEST(Decide, NoSingleEditWhenInfeasibilityCannotBeProved)
+{
+  const Mission m = inline_mission(
+    "{mission_id: busy, subtasks: ["
+    " {id: T1, robot: robot1, deadline_sec: 20},"
+    " {id: X, robot: robot2, deadline_sec: 30},"
+    " {id: T2, robot: robot2, deadline_sec: 15, predecessors: [T1]},"
+    " {id: Y, robot: robot3, work: 15, deadline_sec: 30}]}");
+  RuntimeState s = RuntimeState::initial(m);
+  s.now_ms = 2000;
+  set_executing(m, s, "T1", 0, 9000);
+  s.tasks[m.task_index("T1")].same_robot_retry_feasible = false;
+  set_executing(m, s, "X", 0, 5500);
+  set_executing(m, s, "Y", 0, 10000);
+  const dwafp::Decision d = decide_event(m, s, {"T1"});
+  EXPECT_EQ(d.status, dwafp::DecisionStatus::kNoSingleEdit);
+  EXPECT_TRUE(d.unprotectable.empty());
+  EXPECT_EQ(d.stage1.generated, 4u);
+}
+
+// Ablation scopes on the event of SubstitutionOfTheDownstreamTaskIsBest:
+//   sources only (T1)      : 3 primitives; best = T1 -> robot3 (the downstream fix is not seen)
+//   region (T1, T2)        : 5 primitives; best = T2 in robot1's next slot
+//   all unfinished (T1, T2): the same 5 here (the region already contains every unfinished task)
+TEST(StageOne, RepairScopesForTheAblation)
+{
+  const Mission m = chain(20, 14);
+  RuntimeState s = RuntimeState::initial(m);
+  s.now_ms = 2000;
+  set_executing(m, s, "T1", 0, 6000);
+
+  dwafp::RepairConfig sources;
+  sources.scope = dwafp::RepairScope::kSources;
+  const Event e_src(m, s, {"T1"}, sources);
+  EXPECT_EQ(e_src.stage1.generated, 3u);
+  EXPECT_EQ(e_src.best().task, m.task_index("T1"));
+  EXPECT_EQ(e_src.best().robot, m.robot_index("robot3"));
+
+  const Event e_region(m, s, {"T1"});
+  EXPECT_EQ(e_region.stage1.generated, 5u);
+  EXPECT_EQ(e_region.best().task, m.task_index("T2"));
+
+  dwafp::RepairConfig all;
+  all.scope = dwafp::RepairScope::kAllUnfinished;
+  const Event e_all(m, s, {"T1"}, all);
+  EXPECT_EQ(e_all.stage1.generated, 5u);
+}
+
+// Soundness of the certificate on random events: whenever unprotectable_threats() is not empty,
+// even the GLOBAL single-edit oracle (every unfinished task, every robot) finds no preventive
+// repair. The test also checks that both outcomes actually occur (the property is not vacuous).
+TEST(Decide, CertificateIsSoundOnRandomEvents)
+{
+  std::mt19937 rng(7);
+  const auto uniform = [&rng](int lo, int hi) {return std::uniform_int_distribution<int>(lo, hi)(rng);};
+  const char * robots[] = {"robot1", "robot2", "robot3"};
+  int certified = 0, searched = 0;
+  for (int round = 0; round < 400; ++round) {
+    std::string yaml = "{mission_id: r, subtasks: [";
+    for (int j = 0; j < 8; ++j) {
+      yaml += std::string(j ? "," : "") + "{id: T" + std::to_string(j) + ", robot: " +
+        robots[uniform(0, 2)] + ", work: " + std::to_string(uniform(2, 6)) + ", deadline_sec: " +
+        std::to_string(uniform(8, 40)) + ", retryable: " + (uniform(0, 4) ? "true" : "false") +
+        ", predecessors: [";
+      bool first = true;
+      for (int h = 0; h < j; ++h) {
+        if (uniform(0, 3) == 0) {yaml += std::string(first ? "" : ",") + "T" + std::to_string(h); first = false;}
+      }
+      yaml += "]}";
+    }
+    yaml += "]}";
+    const Mission m = inline_mission(yaml);
+    const Plan plan = Plan::initial(m);
+    RuntimeState s0 = RuntimeState::initial(m);
+    const DurationSnapshot p = DurationSnapshot::capture(m, dwafp::ConfigDurationModel{}, s0);
+    const Prediction nominal = Predictor(m, plan, s0, p).full();
+
+    // State at a random time as planned, then a random running task deviates.
+    const TimeMs t = uniform(500, 15000);
+    RuntimeState actual = RuntimeState::initial(m);
+    actual.now_ms = t;
+    std::vector<Index> running;
+    for (Index j = 0; j < m.task_count(); ++j) {
+      const auto & q = nominal.tasks[j];
+      if (q.finish_ms <= t) {
+        actual.tasks[j].status = TaskStatus::kCompleted;
+        actual.tasks[j].start_ms = q.start_ms;
+        actual.tasks[j].end_ms = q.finish_ms;
+      } else if (q.start_ms <= t) {
+        actual.tasks[j].status = TaskStatus::kExecuting;
+        actual.tasks[j].start_ms = q.start_ms;
+        actual.tasks[j].remaining_ms = q.finish_ms - t;
+        running.push_back(j);
+      }
+    }
+    if (running.empty()) {continue;}
+    const Index k = running[static_cast<std::size_t>(uniform(0, static_cast<int>(running.size()) - 1))];
+    if (uniform(0, 2) == 0) {
+      actual.tasks[k].status = TaskStatus::kFailed;
+      actual.tasks[k].end_ms = t;
+    } else {
+      actual.tasks[k].remaining_ms += uniform(1000, 12000);
+    }
+    actual.tasks[k].same_robot_retry_feasible = uniform(0, 1) == 1;
+    dwafp::RepairConfig config;
+    config.dispatch_overhead_ms = uniform(0, 2) * 1000;
+
+    const RuntimeState expected = dwafp::expected_state(m, plan, actual, nominal, {k}, {});
+    const ImpactAnalysis impact = dwafp::analyze_impact(m, plan, expected, actual, p);
+    if (!impact.needs_repair()) {continue;}
+    const auto unprotectable = dwafp::unprotectable_threats(m, plan, actual, p, impact, config);
+    config.scope = dwafp::RepairScope::kAllUnfinished;
+    const StageOneResult global = dwafp::generate_single_edits(m, plan, actual, p, impact, config);
+    if (!unprotectable.empty()) {
+      ++certified;
+      EXPECT_FALSE(global.best) << "round " << round << ": certified infeasible, yet repaired\n" << yaml;
+    } else {
+      ++searched;
+    }
+  }
+  EXPECT_GT(certified, 10);
+  EXPECT_GT(searched, 10);
+}
+

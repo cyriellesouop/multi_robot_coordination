@@ -35,9 +35,14 @@ ament_target_dependencies(robot_action_server rclcpp rclcpp_action multi_robot_i
 add_executable(coordinator_action_client src/coordinator_action_client.cpp)
 ament_target_dependencies(coordinator_action_client rclcpp rclcpp_action multi_robot_interfaces geometry_msgs diagnostic_msgs)
 
+# Stage I experiments, ROS-free: links only the DWAFP library (no rclcpp).
+add_executable(stage1_experiments src/stage1_experiments.cpp)
+target_link_libraries(stage1_experiments dwafp_core)
+
 install(TARGETS 
 robot_action_server 
 coordinator_action_client
+stage1_experiments
 DESTINATION lib/${PROJECT_NAME}/
 ) # After building, copy the executable robot_action_server into the install directory so ROS 2 can find and run it
 

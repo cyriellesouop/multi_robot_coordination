@@ -13,14 +13,16 @@
 // Response window: the edited task cannot start before t + T_decision + T_dispatch (its release
 // time), and the propagation decides whether every threatened condition still holds. A latency
 // therefore costs nothing when the task would wait for its inputs anyway, and makes an upstream
-// repair too late when its successors need its output earlier. When B_i = 0 the threatened
-// condition is already due: candidates are still evaluated, but none is reported as preventive.
+// repair too late when its successors need its output earlier. The incumbent window B_i^0 does
+// NOT filter candidates: it is computed with the durations of the CURRENT assignment, so a
+// candidate that moves a task to a faster robot can be preventive even when B_i^0 = 0 (every
+// candidate is judged by its own activation-aware propagation, with its own robot's duration).
 //
 // Policies (the bounded library of the paper; hold and escalation are guards, not candidates):
 //   retry        : the task's own robot restarts it (a failed task, or a running one that is
 //                  cancelled and started again). Applicable only when the task is restartable
 //                  (Subtask::retryable), its robot is operational (available), and the triggering
-//                  condition is transient or has cleared (TaskRuntime::retry_available). A
+//                  condition is transient or has cleared (TaskRuntime::same_robot_retry_feasible). A
 //                  persistent blockage excludes retry; substitution or escalation remain.
 //   substitution : the task moves to another available robot. The task is unstarted, or executing /
 //                  failed and retryable (it restarts there). If the receiving robot is busy, this
@@ -62,12 +64,22 @@ enum class RepairPolicy
   kTakeover
 };
 
+// Which tasks a repair may edit. DWAFP uses the repair region; the two others exist for the
+// ablation experiments (same policy library, different edit locations).
+enum class RepairScope
+{
+  kRegion,         // DWAFP: tasks of the repair region V_R
+  kSources,        // source-only repair: only the deviating tasks (closest to existing approaches)
+  kAllUnfinished   // global single-edit oracle: every unfinished task, no localization
+};
+
 // Overheads of putting a repair in place. Their sum is the dispatch latency: the edited task is
 // released (may start) at t + T_decision + T_dispatch, and propagation does the rest.
 struct RepairConfig
 {
   TimeMs decision_overhead_ms{0};  // T_decision: time to compute the repair
   TimeMs dispatch_overhead_ms{0};  // T_dispatch: time to cancel / send the goals
+  RepairScope scope{RepairScope::kRegion};
 };
 
 // One primitive repair pi = (o, T_k, r), applied and evaluated.
@@ -96,14 +108,15 @@ struct RepairCandidate
   // Reported for the experiments; the window itself is checked through R (see above).
   TimeMs restoration_ms{0};
 
-  // Removes every threatened condition, with the dispatch latency included in the prediction.
-  // (It is a PREVENTIVE repair only if B_i > 0: see StageOneResult::best.)
+  // Preventive: with the edited task activated at t + T_decision + T_dispatch and its duration on
+  // the candidate's robot, every original threat is removed (deadlines met, outcomes and
+  // assignments restored) and, by admissibility, no new violation is created.
   bool preventive() const {return residual_risk == 0;}
 };
 
 struct StageOneResult
 {
-  // Unstarted subtasks of A_i: held by the engine during the repair search (dependency guard).
+  // Tasks the engine holds during the repair search (see tasks_to_hold()).
   std::vector<Index> to_hold;
   std::size_t generated{0};              // primitives built (every policy x target x robot)
   std::size_t rejected_cycle{0};         // no insertion position keeps the plan acyclic
@@ -112,10 +125,35 @@ struct StageOneResult
   // R > 0 are kept: two of them may form a Stage II repair together.
   std::vector<RepairCandidate> admissible;
   // Index in `admissible` of the best preventive candidate (lexicographic [R, D, C], first one
-  // generated on ties), or nullopt when Stage I finds none (Stage II, then escalation) or when
-  // B_i = 0 (the condition is already due: DWAFP holds and escalates, it cannot prevent it).
+  // generated on ties), or nullopt when Stage I finds none (Stage II, then escalation).
   std::optional<std::size_t> best;
 };
+
+// Hold guard: the unstarted tasks of A_i whose mandatory INPUT (outcome) or ROBOT (assignment) is
+// threatened. They must not start with invalid conditions. A task threatened only by its deadline
+// keeps its normal dispatch (it would be late, not invalid), and unaffected branches continue.
+std::vector<Index> tasks_to_hold(const ImpactAnalysis & impact, const RuntimeState & actual);
+
+// LocalPreventionInfeasible: the threatened tasks whose conditions NO permitted local repair can
+// protect, proved with a lower bound (empty: local prevention may be feasible, run the search).
+// For every task it computes the earliest finish and whether its output can exist under ANY
+// combination of permitted edits, relaxing everything that can only delay:
+//   completed  : its actual finish, output exists
+//   executing  : min(continue: t + r_hat if its robot is available,
+//                    restart if retryable: release + p on the fastest PERMITTED robot), where
+//                permitted = available robots, the task's own robot only if same-robot retry is
+//                feasible, and release = t + T_decision + T_dispatch
+//   failed     : restart if retryable (as above), otherwise its output is lost for good
+//   unstarted  : start >= max(t, earliest finish of its dependency predecessors), plus p on the
+//                fastest available robot (queue edges ignored: they can only delay)
+//   output possible = own output possible AND every dependency predecessor's output possible.
+// Every Stage I or Stage II candidate finishes each task no earlier than this bound and needs its
+// outputs, so a task of A_i whose bound misses its deadline, or whose output cannot exist, is
+// unprotectable: complete local prevention is infeasible. Cost: one pass over the graph.
+std::vector<Index> unprotectable_threats(
+  const Mission & mission, const Plan & incumbent, const RuntimeState & actual,
+  const DurationSnapshot & durations, const ImpactAnalysis & impact,
+  const RepairConfig & config = {});
 
 // Algorithm 2 (GenerateSingleEdits). `incumbent` and `actual` are the plan and state at the event
 // time (the ones `impact` was computed with); `durations` is the snapshot frozen for this event.
@@ -124,6 +162,37 @@ StageOneResult generate_single_edits(
   const Mission & mission, const Plan & incumbent, const RuntimeState & actual,
   const DurationSnapshot & durations, const ImpactAnalysis & impact,
   const RepairConfig & config = {});
+
+// Outcome of one DWAFP event (Algorithm 1, up to Stage I).
+enum class DecisionStatus
+{
+  kContinue,               // no condition newly threatened: continue and monitor
+  kRepair,                 // a preventive single edit was found (stage1.best)
+  kNoFeasibleLocalRepair,  // provably no permitted local repair protects every threat: hold the
+                           // tasks of to_hold, skip the search, report to mission-level recovery
+  kNoSingleEdit            // local prevention not ruled out, but no single edit works: Stage II
+};
+
+struct Decision
+{
+  DecisionStatus status{DecisionStatus::kContinue};
+  ImpactAnalysis impact;
+  std::vector<Index> unprotectable;  // proof of kNoFeasibleLocalRepair (tasks of A_i)
+  std::vector<Index> to_hold;        // tasks the engine must not dispatch for now
+  StageOneResult stage1;             // empty unless the single-edit search ran
+  double impact_us{0};               // timings (wall clock, microseconds), for the experiments
+  double check_us{0};
+  double stage1_us{0};
+};
+
+// Algorithm 1 up to Stage I:
+//   AnalyzeImpact -> nothing threatened: kContinue
+//   -> LocalPreventionInfeasible: hold, kNoFeasibleLocalRepair (no search, no Stage II)
+//   -> GenerateSingleEdits -> best found: kRepair, otherwise kNoSingleEdit (Stage II comes next).
+// The whole mission is never declared unrecoverable: only complete LOCAL prevention of this event.
+Decision decide(
+  const Mission & mission, const Plan & incumbent, const RuntimeState & expected,
+  const RuntimeState & actual, const DurationSnapshot & durations, const RepairConfig & config = {});
 
 }  // namespace dwafp
 
