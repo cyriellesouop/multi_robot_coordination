@@ -24,7 +24,7 @@
 // Generator (identical distributions in every configuration): dependencies only from a lower to a
 // higher index, each with probability min(0.5, 3/N) (about 1.5 predecessors per task on average);
 // work 3..7 units; robot speeds cycle through 1.0 / 1.5 / 0.8 s per unit; random assignment;
-// deadline = nominal finish + absolute slack of 0.5..3 times the task's own duration (B3-B6: the
+// deadline = nominal finish + duration-normalized additive slack of 0.5..3 times the task's own duration (B3-B6: the
 // tight-slack ablation uses 0.2..1.0 and 0.1..0.5). Events: one
 // task running at a random time in the first 60 % of the nominal makespan deviates: a delay of
 // 1..10 s (70 %) or an outcome failure (30 %).
@@ -259,7 +259,7 @@ RandomMission make_random_mission(int n, int robots, std::mt19937 & rng, SlackRa
     }
   }
   {
-    // Nominal schedule without deadline pressure, then absolute slack per task.
+    // Nominal schedule without deadline pressure, then duration-normalized additive slack per task.
     const Mission draft("draft", tasks, fleet);
     const Plan plan = Plan::initial(draft);
     const RuntimeState s0 = RuntimeState::initial(draft);

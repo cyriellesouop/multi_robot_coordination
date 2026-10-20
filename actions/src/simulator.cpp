@@ -52,6 +52,9 @@ Simulator::Simulator(const Mission & mission, Plan plan, WorldConfig config)
     throw std::invalid_argument("simulator: noise must be in [0, 1)");
   }
   if (config_.feedback_period_ms <= 0) {throw std::invalid_argument("simulator: feedback period must be > 0");}
+  if (!(config_.timeout_multiplier == 0.0 || config_.timeout_multiplier >= 1.0)) {
+    throw std::invalid_argument("simulator: timeout multiplier must be 0 (none) or >= 1");
+  }
   for (const InjectedDeviation & d : config_.deviations) {
     if (d.type == DeviationType::kRobotBreakdown) {
       if (d.robot >= mission_.robot_count() || d.at_time_ms < 0) {
@@ -137,6 +140,16 @@ void Simulator::start_attempt(Index j, TimeMs t)
   } else {
     a.end_ms = t + work_end;
   }
+  // Execution timeout: the robot gives up after q = multiplier x nominal duration and reports a
+  // failure (no output) at that time, whatever would have happened later.
+  if (config_.timeout_multiplier > 0.0) {
+    const TimeMs budget = std::llround(config_.timeout_multiplier * static_cast<double>(a.nominal_duration_ms));
+    if (!is_reachable(a.end_ms) || a.end_ms > t + budget) {
+      a.fails = true;
+      a.times_out = true;
+      a.end_ms = t + budget;
+    }
+  }
   attempts_[j] = a;
 
   // Observable state: executing since t; until the first feedback, r_hat = nominal duration.
@@ -170,6 +183,7 @@ void Simulator::finish_attempt(Index j, bool success, TimeMs t, SimulationObserv
   rec.end_ms = t;
   rec.status = success ? FinalStatus::kCompleted : FinalStatus::kFailed;
   rec.deadline_ok = success && t <= mission_.task(j).deadline_ms;
+  if (a.times_out) {++rec.timeouts;}
   if (!success) {
     rec.discarded_work_ms += worked_ms(a, t);  // progress lost
     rec.wasted_elapsed_ms += t - a.start_ms;   // time lost, blocked time included

@@ -629,3 +629,51 @@ TEST(SimulatorControl, RetryDiagnosticFollowsTheRobotTaskPair)
   EXPECT_EQ(mover.seen, (std::vector<bool>{true, false}));
 }
 
+// Execution timeout: with a budget of 2 x the nominal duration, the persistently obstructed T1
+// (5 s nominal on robot1) is given up at 10 s: the robot reports a failure (timeout), 2 s of
+// progress are discarded and 10 s were spent. T2 never starts (its input is missing).
+TEST(Simulator, ExecutionTimeoutEndsAStuckAttempt)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  WorldConfig config;
+  config.timeout_multiplier = 2.0;
+  config.deviations.push_back({DeviationType::kDelay, t1, dwafp::kNoIndex, 0.4, 0, 0, true});
+  Simulator sim(m, Plan::initial(m), config);
+  Recorder obs;
+  const auto & rec = sim.run(&obs);
+  EXPECT_EQ(rec[t1].status, FinalStatus::kFailed);
+  EXPECT_EQ(rec[t1].timeouts, 1);
+  EXPECT_EQ(rec[t1].end_ms, 10000);
+  EXPECT_EQ(rec[t1].discarded_work_ms, 2000);
+  EXPECT_EQ(rec[t1].wasted_elapsed_ms, 10000);
+  EXPECT_EQ(rec[m.task_index("T2")].status, FinalStatus::kNeverStarted);
+  EXPECT_EQ(obs.finished, (std::vector<std::pair<Index, bool>>{{t1, false}}));
+  // A task within its budget is not affected: a 3 s transient blockage ends at 8 s < 10 s.
+  WorldConfig short_block;
+  short_block.timeout_multiplier = 2.0;
+  short_block.deviations.push_back({DeviationType::kDelay, t1, dwafp::kNoIndex, 0.4, 0, 3000, false});
+  Simulator ok(m, Plan::initial(m), short_block);
+  EXPECT_EQ(ok.run()[t1].end_ms, 8000);
+  // The multiplier must be 0 (none) or at least 1.
+  WorldConfig bad;
+  bad.timeout_multiplier = 0.5;
+  EXPECT_THROW(Simulator(m, Plan::initial(m), bad), std::invalid_argument);
+}
+
+// Timeout boundary: an attempt that completes EXACTLY at start + q succeeds. T1 (5 s nominal,
+// budget 10 s) works 2 s, is blocked 5 s, works 3 s: it completes at exactly 10 s.
+TEST(Simulator, CompletionExactlyAtTheTimeoutSucceeds)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  WorldConfig config;
+  config.timeout_multiplier = 2.0;
+  config.deviations.push_back({DeviationType::kDelay, t1, dwafp::kNoIndex, 0.4, 0, 5000, false});
+  Simulator sim(m, Plan::initial(m), config);
+  const auto & rec = sim.run();
+  EXPECT_EQ(rec[t1].status, FinalStatus::kCompleted);
+  EXPECT_EQ(rec[t1].end_ms, 10000);
+  EXPECT_EQ(rec[t1].timeouts, 0);
+}
+

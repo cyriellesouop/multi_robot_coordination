@@ -85,6 +85,13 @@ struct WorldConfig
   std::uint64_t seed{1};           // noise seed (common random numbers across methods)
   double noise{0.0};               // real duration = nominal x U[1 - noise, 1 + noise], noise < 1
   TimeMs feedback_period_ms{500};  // feedback of every executing task at multiples of this period
+  // Execution timeout of every attempt: q = timeout_multiplier x nominal duration p_jr of the task
+  // on the robot running it. An attempt that would run longer (blocked, slowed down, or
+  // persistently obstructed) fails at start + q: the robot reports a TIMEOUT result (no output).
+  // This is the robot's own budget (like timeout_sec of the ExecuteSubtask goal), independent of
+  // the mission deadline. An attempt that completes EXACTLY at start + q succeeds (the timeout
+  // fires only for an attempt that would end later). 0 = no execution timeout.
+  double timeout_multiplier{0.0};
   TimeMs horizon_ms{3600000};      // safety stop (one nominal hour)
   std::vector<InjectedDeviation> deviations;
 };
@@ -108,6 +115,7 @@ struct TaskRecord
   FinalStatus status{FinalStatus::kNeverStarted};
   Index robot{kNoIndex};   // robot of the last attempt
   int attempts{0};
+  int timeouts{0};         // attempts ended by the execution timeout
   TimeMs start_ms{0};      // last attempt
   TimeMs end_ms{0};        // last attempt: completion or failure time
   // Cost of the attempts that did not complete (failed, or cancelled by a repair):
@@ -223,7 +231,8 @@ private:
     bool blocks{false};              // this attempt gets blocked
     TimeMs block_start_ms{0};        // absolute
     TimeMs block_end_ms{0};          // absolute; kUnreachable for a persistent obstruction
-    bool fails{false};               // this attempt ends with an outcome failure
+    bool fails{false};               // this attempt ends with an outcome failure (or a timeout)
+    bool times_out{false};           // ... because the execution timeout was reached
     TimeMs end_ms{0};                // completion or failure time (absolute; kUnreachable if never)
   };
 

@@ -24,6 +24,7 @@ add_library(dwafp_core STATIC
   src/repair.cpp  # C3: Stage I single-edit repair candidates
   src/simulator.cpp  # C6: closed-loop simulator (the world)
   src/controllers.cpp  # C6: the compared methods as simulator controllers
+  src/scenarios.cpp  # C6: scenario generator
 )
 target_include_directories(dwafp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -82,6 +83,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_controllers dwafp_core)
   target_compile_definitions(test_controllers PRIVATE
     ACTIONS_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/config")
+
+  # C6: scenario generator.
+  ament_add_gtest(test_scenarios test/test_scenarios.cpp)
+  target_link_libraries(test_scenarios dwafp_core)
 
   # C3: Stage I repair candidates, same config files.
   ament_add_gtest(test_repair test/test_repair.cpp)
