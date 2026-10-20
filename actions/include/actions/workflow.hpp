@@ -190,7 +190,8 @@ struct TaskRuntime
 {
   TaskStatus status{TaskStatus::kUnstarted};
   TimeMs start_ms{0};      // executing / completed / failed: actual start time
-  TimeMs remaining_ms{0};  // executing: the robot's estimate r_hat_j(t) of its remaining time
+  TimeMs remaining_ms{0};  // executing: estimate r_hat_j(t) of its remaining time (kUnreachable:
+                           // it will never end on this robot, e.g. a persistent obstruction)
   TimeMs end_ms{0};        // completed: actual finish time; failed: failure time t_fail
   // unstarted: earliest time the task may start, whatever else allows it (0 = no constraint).
   // A repair sets it to t + T_decision + T_dispatch on the task it edits, so the dispatch latency

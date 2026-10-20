@@ -703,3 +703,28 @@ TEST(Decide, CertificateIsSoundOnRandomEvents)
   EXPECT_GT(searched, 10);
 }
 
+// Latency semantics shared with the simulator: a RUNNING task moved to another robot keeps its old
+// robot busy until activation. robot1 runs T1 (persistently blocked, predicts 9 s) then X
+// (independent). With 3 s of latency, moving T1 to robot3 at t = 2 s frees robot1 only at 5 s:
+// X is predicted to start at 5 s, not at 2 s.
+TEST(StageOne, MovedRunningTaskKeepsItsOldRobotBusyUntilActivation)
+{
+  const Mission m = inline_mission(
+    "{mission_id: busy_until, subtasks: ["
+    " {id: T1, robot: robot1, deadline_sec: 20},"
+    " {id: X, robot: robot1, deadline_sec: 40},"
+    " {id: T2, robot: robot2, deadline_sec: 14, predecessors: [T1]}]}");
+  RuntimeState s = RuntimeState::initial(m);
+  s.now_ms = 2000;
+  set_executing(m, s, "T1", 0, 7000);
+  s.tasks[m.task_index("T1")].same_robot_retry_feasible = false;
+  dwafp::RepairConfig config;
+  config.dispatch_overhead_ms = 3000;
+  const Event e(m, s, {"T1"}, config);
+  const RepairCandidate * move = e.find(RepairPolicy::kSubstitution, "T1", "robot3");
+  ASSERT_TRUE(move);
+  EXPECT_EQ(move->prediction.tasks[m.task_index("X")].start_ms, 5000);
+  EXPECT_EQ(move->prediction.tasks[m.task_index("T1")].start_ms, 5000);  // released at 5 s on robot3
+  e.expect_consistent();
+}
+

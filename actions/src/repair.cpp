@@ -80,6 +80,12 @@ void evaluate(const Context & c, RepairPolicy policy, Index k, Index r_new, bool
   // Response window as part of the prediction: the edited task cannot start before the repair is
   // decided and dispatched.
   state.tasks[k].release_ms = now + c.config.decision_overhead_ms + c.config.dispatch_overhead_ms;
+  // Same latency semantics as the world: a RUNNING task that moves to another robot keeps
+  // occupying its old robot until the edit is activated (it is cancelled only then), so the old
+  // robot cannot start its next task before the release time.
+  if (status_before == TaskStatus::kExecuting && r_new != r_old) {
+    state.robots[r_old].available_from_ms = std::max(state.robots[r_old].available_from_ms, state.tasks[k].release_ms);
+  }
   std::vector<std::vector<Index>> queues = c.incumbent.queues();
   auto & old_queue = queues[r_old];
   old_queue.erase(std::find(old_queue.begin(), old_queue.end(), k));
@@ -349,7 +355,7 @@ std::vector<Index> unprotectable_threats(
         output_possible[j] = true;
         break;
       case TaskStatus::kExecuting: {
-          const TimeMs cont = own_available ? now + task.remaining_ms : kUnreachable;
+          const TimeMs cont = own_available && is_reachable(task.remaining_ms) ? now + task.remaining_ms : kUnreachable;
           lb_finish[j] = std::min(cont, restart());
           output_possible[j] = is_reachable(lb_finish[j]);
           break;

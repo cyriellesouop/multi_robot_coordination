@@ -441,7 +441,9 @@ TaskPrediction Predictor::predict_task(Index j, const Prediction & prediction) c
       if (robot.available) {
         // The deviation enters here: f_hat = t + r_hat_j(t), from the robot's own estimate.
         // Fork-join test: at t = 4 s robot1 says "5 s left" for T1 -> f_hat(T1) = 9 s.
-        out.finish_ms = now + task.remaining_ms;
+        // r_hat may be kUnreachable: the controller's estimate for a robot that reported a
+        // persistent obstruction (it will not get past it): then the task never ends there.
+        out.finish_ms = is_reachable(task.remaining_ms) ? now + task.remaining_ms : kUnreachable;
       } else {
         // Robot-unavailability failure: the running task stopped when the robot became
         // unavailable (never before it started). That time is real (it is in the past), so it
