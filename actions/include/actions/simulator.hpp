@@ -27,12 +27,16 @@
 //   2. robot breakdowns at t (the running attempt stops without its output);
 //   3. deadline misses at t (every task not completed by its deadline, reported once);
 //   4. feedback of the running attempts (if t is a multiple of the feedback period);
-//   5. dispatch.
+//   5. installation of the scheduled edits whose activation time is t (an edit whose task has
+//      completed by then is rejected: a completion at t comes first);
+//   6. the observer's act(): the ONLY moment a controller may hold tasks or edit the plan;
+//   7. dispatch (so a task restarted or moved at t can start at t).
 
 #ifndef ACTIONS__SIMULATOR_HPP_
 #define ACTIONS__SIMULATOR_HPP_
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "actions/impact.hpp"     // FeedbackSample
@@ -93,8 +97,10 @@ enum class FinalStatus
 {
   kCompleted,    // finished with its output
   kFailed,       // its last attempt failed (outcome failure or robot breakdown)
-  kNeverStarted, // never dispatched (missing input, held, unusable robot, or a stuck queue)
-  kIncomplete    // started, but still running or blocked when the run ended (horizon)
+  kNeverStarted,   // never dispatched (attempts = 0): missing input, held, unusable robot, or a
+                   // stuck queue
+  kUnstartedAtEnd, // had attempts, but was cancelled or reset by a repair and not run again
+  kIncomplete      // started, but still running or blocked when the run ended (horizon)
 };
 
 struct TaskRecord
@@ -104,7 +110,7 @@ struct TaskRecord
   int attempts{0};
   TimeMs start_ms{0};      // last attempt
   TimeMs end_ms{0};        // last attempt: completion or failure time
-  // Cost of the attempts that did not complete (failed or, in Step 2, cancelled):
+  // Cost of the attempts that did not complete (failed, or cancelled by a repair):
   TimeMs discarded_work_ms{0};  // physical progress lost (working time, blocked time excluded)
   TimeMs wasted_elapsed_ms{0};  // elapsed time spent on them (blocked time included)
   bool deadline_ok{false};      // completed, and end_ms <= deadline
@@ -114,6 +120,18 @@ struct TaskRecord
 // ----------------------------------------------------------------------------------------------
 // What a controller receives (Step 2 builds controllers on this interface)
 // ----------------------------------------------------------------------------------------------
+
+// Counts of the repairs a controller asked for (for the experiments: how many repairs were
+// actually put in place, and why the others were not). Each edit is counted exactly once.
+struct EditCounts
+{
+  int scheduled{0};                // schedule_edit() calls (any activation time)
+  int installed{0};                // edits installed (scheduled ones and direct apply_edit() calls)
+  int rejected_task_completed{0};  // an edited task had completed (before activation)
+  int rejected_invalid{0};         // the edit did not fit the state / plan (invalid)
+};
+
+class Simulator;
 
 class SimulationObserver
 {
@@ -125,9 +143,15 @@ public:
   virtual void on_task_finished(Index /*task*/, bool /*success*/, TimeMs /*time_ms*/) {}
   // A robot became unavailable.
   virtual void on_robot_unavailable(Index /*robot*/, TimeMs /*time_ms*/) {}
+  // A scheduled edit reached its activation time: installed, or rejected because an edited task
+  // completed before activation or the edit no longer fits the state.
+  virtual void on_edit_installed(bool /*installed*/, TimeMs /*time_ms*/) {}
   // A task was not completed by its deadline (reported once, at the deadline). It may still be
   // running, blocked, failed or not started; the miss is recorded for good.
   virtual void on_deadline_missed(Index /*task*/, TimeMs /*time_ms*/) {}
+  // Called once per time step, after all the notifications above and before dispatch. A
+  // controller decides here and acts through sim.set_held() and sim.apply_edit().
+  virtual void act(Simulator & /*sim*/) {}
 };
 
 // ----------------------------------------------------------------------------------------------
@@ -156,9 +180,37 @@ public:
   const RuntimeState & state() const {return state_;}
   const std::vector<TaskRecord> & records() const {return records_;}
 
-  // --- What a controller may change (Step 2 adds plan edits) --------------------------------
+  const Mission & mission() const {return mission_;}
+  const EditCounts & edit_counts() const {return edit_counts_;}
+
+  // --- What a controller may change (only from SimulationObserver::act) -----------------------
   // Tasks the dispatcher must not start (hold guard); replaces the previous set.
   void set_held(const std::vector<Index> & tasks);
+
+  // Asks for a step at time t (> now), even if nothing else happens then, so the controller's
+  // act() runs at t (a timer: e.g. releasing a hold, or a timeout of a reactive method).
+  void request_wakeup(TimeMs t);
+
+  // Schedules a repair decided now, to be INSTALLED at activation_ms = now + T_decision +
+  // T_dispatch. Until then the world goes on with the old plan: the running task keeps making
+  // progress and the old robot queues stay active. At activation the edit is installed as by
+  // apply_edit(), or rejected (on_edit_installed(false)) if an edited task has completed by then
+  // or the edit no longer fits the state. activation_ms <= now installs it immediately.
+  void schedule_edit(const Plan & new_plan, const std::vector<Index> & edited, TimeMs activation_ms);
+
+  // Installs a repair NOW (zero latency): `new_plan` becomes the incumbent plan, and every task
+  // of `edited`
+  //   - if running: is CANCELLED (its progress is discarded and counted in discarded_work_ms and
+  //     wasted_elapsed_ms) and becomes unstarted, to be dispatched again;
+  //   - if failed: becomes unstarted again (a retry);
+  //   - if unstarted: stays unstarted (e.g. moved to another queue);
+  //   and may start no earlier than release_ms (at least now).
+  // Retry diagnostic: same robot -> the current diagnostic is kept; another robot -> the
+  // diagnostic of the NEW robot-task pair (feasible unless that pair reported a persistent
+  // obstruction before). Nothing changes if the edit is invalid: throws std::invalid_argument
+  // when the plan is of another mission, an edited task is completed, a running task changes
+  // robot without being edited, or the state does not fit the new queues (Predictor check).
+  void apply_edit(const Plan & new_plan, const std::vector<Index> & edited, TimeMs release_ms);
 
 private:
   // Ground truth of one running attempt.
@@ -194,6 +246,27 @@ private:
   std::vector<TimeMs> clear_ms_;        // per deviation: absolute clearing time of a transient
                                         // obstruction, once the first attempt has reached it
   std::vector<bool> deadline_reported_; // per task: miss already reported
+  std::vector<TimeMs> wakeups_;         // times requested by the controller, still to come
+  // Edits waiting for their activation time, in scheduling order.
+  struct PendingEdit
+  {
+    Plan plan;
+    std::vector<Index> edited;
+    TimeMs activation_ms;
+  };
+  std::vector<PendingEdit> pending_edits_;
+  EditCounts edit_counts_;
+
+  // Why an edit was or was not installed.
+  enum class EditOutcome {kInstalled, kTaskCompleted, kInvalid};
+  // Tries to install an edit, counts the outcome in edit_counts_, and returns it (with the reason
+  // in `error` when it is not installed). Nothing changes when it is not installed.
+  EditOutcome install(const Plan & new_plan, const std::vector<Index> & edited, TimeMs release_ms,
+    std::string * error);
+  // The installation itself (throws std::invalid_argument, without side effects, if invalid).
+  void install_or_throw(const Plan & new_plan, const std::vector<Index> & edited, TimeMs release_ms);
+  // Per (task, robot): the robot reported a persistent obstruction on that task (row-major).
+  std::vector<bool> persistent_pair_;
   bool started_{false};                 // the first step processes time 0
   bool finished_{false};                // the run is over (statuses finalized)
 };

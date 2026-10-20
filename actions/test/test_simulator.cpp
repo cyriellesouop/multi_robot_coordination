@@ -6,6 +6,7 @@
 
 #include <gtest/gtest.h>
 
+#include <functional>
 #include <random>
 #include <string>
 #include <vector>
@@ -341,3 +342,290 @@ TEST(Simulator, RobotWaitsForTheNextTaskOfItsFixedQueue)
   EXPECT_EQ(rec[m.task_index("E")].start_ms, 12500);
   EXPECT_EQ(rec[m.task_index("E")].end_ms, 20000);
 }
+
+// =============================================================================================
+// Step 2: controller interface (act(), set_held, apply_edit)
+// =============================================================================================
+
+namespace
+{
+// A controller that performs one scripted action at the first step at or after `at`.
+struct Scripted : dwafp::SimulationObserver
+{
+  TimeMs at{0};
+  std::function<void(Simulator &)> action;
+  bool done{false};
+  std::vector<std::pair<bool, TimeMs>> installs;  // results of scheduled edits
+  Scripted(TimeMs when, std::function<void(Simulator &)> what) : at(when), action(std::move(what)) {}
+  void on_edit_installed(bool installed, TimeMs t) override {installs.emplace_back(installed, t);}
+  void act(Simulator & sim) override
+  {
+    if (!done && sim.now() >= at) {
+      done = true;
+      action(sim);
+    }
+  }
+};
+
+// chain.yaml with a blockage of T1 at 40 % of its work (2 s in), for `delay` ms.
+WorldConfig blocked_chain(const Mission & m, TimeMs delay, bool persistent)
+{
+  WorldConfig config;
+  config.horizon_ms = 60000;
+  config.deviations.push_back({DeviationType::kDelay, m.task_index("T1"), dwafp::kNoIndex, 0.4, 0, delay, persistent});
+  return config;
+}
+}  // namespace
+
+// Transient obstruction of T1: blocked at 2 s, it clears at the ABSOLUTE time 7 s.
+// A retry at 3 s (same robot) reaches the obstruction at 3 + 2 = 5 s, before it clears, so it
+// waits only until 7 s (not for a new 5 s delay), then works 3 s: T1 ends 10 s, T2 runs 10-17.5 s.
+// The cancelled first attempt: 2 s of progress discarded, 3 s of time wasted.
+TEST(SimulatorControl, RetryBeforeTheObstructionClearsWaitsForTheOriginalClearingTime)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  Simulator sim(m, Plan::initial(m), blocked_chain(m, 5000, false));
+  Scripted retry(3000, [&](Simulator & s) {s.apply_edit(s.plan(), {t1}, s.now());});
+  const auto & rec = sim.run(&retry);
+  EXPECT_EQ(rec[t1].attempts, 2);
+  EXPECT_EQ(rec[t1].start_ms, 3000);
+  EXPECT_EQ(rec[t1].end_ms, 10000);
+  EXPECT_EQ(rec[t1].discarded_work_ms, 2000);
+  EXPECT_EQ(rec[t1].wasted_elapsed_ms, 3000);
+  EXPECT_EQ(rec[m.task_index("T2")].end_ms, 17500);
+}
+
+// Same obstruction, retry at 6 s: the new attempt reaches the obstruction at 8 s, after it cleared
+// at 7 s, so it is not blocked at all: T1 runs 6-11 s.
+TEST(SimulatorControl, RetryAfterTheObstructionClearsIsNotBlocked)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  Simulator sim(m, Plan::initial(m), blocked_chain(m, 5000, false));
+  Scripted retry(6000, [&](Simulator & s) {s.apply_edit(s.plan(), {t1}, s.now());});
+  const auto & rec = sim.run(&retry);
+  EXPECT_EQ(rec[t1].end_ms, 11000);
+  EXPECT_EQ(rec[t1].wasted_elapsed_ms, 6000);
+}
+
+// Persistent obstruction of robot1 on T1. Retrying on robot1 hits it again: T1 ends incomplete.
+TEST(SimulatorControl, RetryOnThePersistentlyBlockedPairIsBlockedAgain)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  Simulator sim(m, Plan::initial(m), blocked_chain(m, 0, true));
+  Scripted retry(3000, [&](Simulator & s) {s.apply_edit(s.plan(), {t1}, s.now());});
+  const auto & rec = sim.run(&retry);
+  EXPECT_EQ(rec[t1].attempts, 2);
+  EXPECT_EQ(rec[t1].status, FinalStatus::kIncomplete);
+}
+
+// Substitution under a persistent obstruction: at 3 s T1 is moved to robot3 with a 0.5 s dispatch
+// latency. robot3 is not obstructed: T1 runs 3.5-7.5 s (4 s), then T2 7.5-15 s on robot2.
+TEST(SimulatorControl, SubstitutionMovesTheTaskToAnotherRobot)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  const Index t2 = m.task_index("T2");
+  Simulator sim(m, Plan::initial(m), blocked_chain(m, 0, true));
+  Scripted move(3000, [&](Simulator & s) {
+      s.apply_edit(Plan::from_queues(m, {{}, {t2}, {t1}}), {t1}, s.now() + 500);
+    });
+  const auto & rec = sim.run(&move);
+  EXPECT_EQ(rec[t1].status, FinalStatus::kCompleted);
+  EXPECT_EQ(rec[t1].robot, m.robot_index("robot3"));
+  EXPECT_EQ(rec[t1].start_ms, 3500);
+  EXPECT_EQ(rec[t1].end_ms, 7500);
+  EXPECT_EQ(rec[t1].discarded_work_ms, 2000);
+  EXPECT_EQ(rec[t1].wasted_elapsed_ms, 3000);
+  EXPECT_EQ(rec[t2].start_ms, 7500);
+  EXPECT_EQ(rec[t2].end_ms, 15000);
+}
+
+// Common random numbers: with noise, a controller that retries T1 does not change the noise of
+// an unaffected task. In fork_join, T2 (robot2, independent of T1) runs exactly the same with or
+// without the retry; T1's second attempt gets its own draw.
+TEST(SimulatorControl, ExtraRetriesDoNotChangeTheNoiseOfOtherTasks)
+{
+  const Mission m = load("fork_join.yaml");
+  const Index t1 = m.task_index("T1");
+  const Index t2 = m.task_index("T2");
+  WorldConfig config;
+  config.noise = 0.2;
+  config.seed = 5;
+  Simulator plain(m, Plan::initial(m), config);
+  const auto rec_plain = plain.run();
+  Simulator retried(m, Plan::initial(m), config);
+  Scripted retry(2000, [&](Simulator & s) {s.apply_edit(s.plan(), {t1}, s.now());});
+  const auto rec_retried = retried.run(&retry);
+  EXPECT_EQ(rec_retried[t1].attempts, 2);
+  EXPECT_EQ(rec_plain[t2].start_ms, rec_retried[t2].start_ms);
+  EXPECT_EQ(rec_plain[t2].end_ms, rec_retried[t2].end_ms);
+}
+
+// An invalid edit changes nothing: moving the RUNNING T1 to robot3 without restarting it throws,
+// and the run then proceeds exactly as planned (T1 0-5 s, T2 5-12.5 s). Editing a completed task
+// throws too.
+TEST(SimulatorControl, InvalidEditsAreRejectedWithoutSideEffects)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  const Index t2 = m.task_index("T2");
+  Simulator sim(m, Plan::initial(m), WorldConfig{});
+  bool threw = false;
+  Scripted bad(1000, [&](Simulator & s) {
+      try {
+        s.apply_edit(Plan::from_queues(m, {{}, {t2}, {t1}}), {}, s.now());
+      } catch (const std::invalid_argument &) {
+        threw = true;
+      }
+    });
+  const auto & rec = sim.run(&bad);
+  EXPECT_TRUE(threw);
+  EXPECT_EQ(rec[t1].end_ms, 5000);
+  EXPECT_EQ(rec[t2].end_ms, 12500);
+  EXPECT_THROW(sim.apply_edit(sim.plan(), {t1}, sim.now()), std::invalid_argument);  // completed
+  // Both rejections are counted, each with its reason; nothing was installed.
+  EXPECT_EQ(sim.edit_counts().installed, 0);
+  EXPECT_EQ(sim.edit_counts().rejected_invalid, 1);         // running task moved without restart
+  EXPECT_EQ(sim.edit_counts().rejected_task_completed, 1);  // T1 already completed
+}
+
+// Hold, then release: a controller holds T2 until 9 s; T2 then starts at 9 s and ends 16.5 s.
+TEST(SimulatorControl, HeldTaskStartsWhenReleased)
+{
+  const Mission m = load("chain.yaml");
+  const Index t2 = m.task_index("T2");
+  struct HoldUntil : dwafp::SimulationObserver
+  {
+    Index task;
+    TimeMs until;
+    void act(Simulator & s) override
+    {
+      s.set_held(s.now() < until ? std::vector<Index>{task} : std::vector<Index>{});
+      // Nothing else happens at 9 s: ask to be called then (only while it is still ahead).
+      if (s.now() < until) {s.request_wakeup(until);}
+    }
+  } hold;
+  hold.task = t2;
+  hold.until = 9000;
+  Simulator sim(m, Plan::initial(m), WorldConfig{});
+  const auto & rec = sim.run(&hold);
+  EXPECT_EQ(rec[t2].start_ms, 9000);
+  EXPECT_EQ(rec[t2].end_ms, 16500);
+}
+
+// A task cancelled by a repair and never run again is "unstarted at the end", not "never
+// started": T1 is cancelled at 3 s and held for good.
+TEST(SimulatorControl, CancelledTaskIsUnstartedAtTheEnd)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  Simulator sim(m, Plan::initial(m), WorldConfig{});
+  Scripted cancel(3000, [&](Simulator & s) {
+      s.apply_edit(s.plan(), {t1}, s.now());
+      s.set_held({t1});
+    });
+  const auto & rec = sim.run(&cancel);
+  EXPECT_EQ(rec[t1].attempts, 1);
+  EXPECT_EQ(rec[t1].status, FinalStatus::kUnstartedAtEnd);
+}
+
+// Dispatch latency in the world: a move of T1 to robot3 is DECIDED at 1 s and ACTIVATED at 3 s.
+// Until 3 s, T1 keeps running on robot1 and makes progress: 3 s of work are discarded at
+// activation (not 1 s). T1 then runs 3-7 s on robot3, T2 7-14.5 s.
+TEST(SimulatorControl, RunningTaskContinuesDuringTheLatency)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  const Index t2 = m.task_index("T2");
+  Simulator sim(m, Plan::initial(m), WorldConfig{});
+  Scripted move(1000, [&](Simulator & s) {
+      s.schedule_edit(Plan::from_queues(m, {{}, {t2}, {t1}}), {t1}, s.now() + 2000);
+    });
+  const auto & rec = sim.run(&move);
+  EXPECT_EQ(move.installs, (std::vector<std::pair<bool, TimeMs>>{{true, 3000}}));
+  EXPECT_EQ(sim.edit_counts().scheduled, 1);
+  EXPECT_EQ(sim.edit_counts().installed, 1);
+  EXPECT_EQ(rec[t1].discarded_work_ms, 3000);
+  EXPECT_EQ(rec[t1].start_ms, 3000);
+  EXPECT_EQ(rec[t1].end_ms, 7000);
+  EXPECT_EQ(rec[t1].robot, m.robot_index("robot3"));
+  EXPECT_EQ(rec[t2].end_ms, 14500);
+}
+
+// The old queues stay active until the edit is installed. robot1 runs A then B; at 1 s a move of
+// B to robot3 is scheduled for 6 s. A ends at 5 s, so robot1 starts B at 5 s under the OLD plan;
+// at 6 s the edit cancels it (1 s discarded) and B runs 6-10 s on robot3.
+TEST(SimulatorControl, OldQueuesStayActiveUntilTheEditIsInstalled)
+{
+  const Mission m = inline_mission(
+    "{mission_id: q, subtasks: [{id: A, robot: robot1, deadline_sec: 20},"
+    " {id: B, robot: robot1, deadline_sec: 20}]}");
+  const Index a = m.task_index("A");
+  const Index b = m.task_index("B");
+  Simulator sim(m, Plan::initial(m), WorldConfig{});
+  Scripted move(1000, [&](Simulator & s) {
+      s.schedule_edit(Plan::from_queues(m, {{a}, {}, {b}}), {b}, 6000);
+    });
+  const auto & rec = sim.run(&move);
+  EXPECT_EQ(move.installs, (std::vector<std::pair<bool, TimeMs>>{{true, 6000}}));
+  EXPECT_EQ(rec[b].attempts, 2);               // first on robot1 (old plan), then on robot3
+  EXPECT_EQ(rec[b].discarded_work_ms, 1000);   // robot1 worked on B from 5 s to 6 s
+  EXPECT_EQ(rec[b].start_ms, 6000);
+  EXPECT_EQ(rec[b].end_ms, 10000);
+  EXPECT_EQ(rec[b].robot, m.robot_index("robot3"));
+}
+
+// An edit whose task completes before activation is rejected: a retry of T1 is scheduled at 1 s
+// for 6 s, but T1 completes at 5 s. Nothing changes: T1 0-5 s (1 attempt), T2 5-12.5 s.
+TEST(SimulatorControl, EditIsRejectedIfItsTaskCompletesBeforeActivation)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  Simulator sim(m, Plan::initial(m), WorldConfig{});
+  Scripted retry(1000, [&](Simulator & s) {s.schedule_edit(s.plan(), {t1}, 6000);});
+  const auto & rec = sim.run(&retry);
+  EXPECT_EQ(retry.installs, (std::vector<std::pair<bool, TimeMs>>{{false, 6000}}));
+  EXPECT_EQ(sim.edit_counts().scheduled, 1);
+  EXPECT_EQ(sim.edit_counts().installed, 0);
+  EXPECT_EQ(sim.edit_counts().rejected_task_completed, 1);
+  EXPECT_EQ(sim.edit_counts().rejected_invalid, 0);
+  EXPECT_EQ(rec[t1].attempts, 1);
+  EXPECT_EQ(rec[t1].end_ms, 5000);
+  EXPECT_EQ(rec[m.task_index("T2")].end_ms, 12500);
+}
+
+// The retry diagnostic belongs to the (task, robot) pair. robot1 reports a persistent obstruction
+// on T1 (retry infeasible). Moved to robot3, T1's diagnostic is robot3's: feasible. Moved back to
+// robot1, the remembered pair diagnostic applies again: infeasible.
+TEST(SimulatorControl, RetryDiagnosticFollowsTheRobotTaskPair)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  const Index t2 = m.task_index("T2");
+  struct MoveTwice : dwafp::SimulationObserver
+  {
+    const Mission * m{nullptr};
+    Index t1{0}, t2{0};
+    std::vector<bool> seen;  // diagnostic right after each move
+    void act(Simulator & s) override
+    {
+      if (s.now() == 3000) {
+        s.apply_edit(Plan::from_queues(*m, {{}, {t2}, {t1}}), {t1}, s.now());
+        seen.push_back(s.state().tasks[t1].same_robot_retry_feasible);
+      } else if (s.now() == 4000) {
+        s.apply_edit(Plan::from_queues(*m, {{t1}, {t2}, {}}), {t1}, s.now());
+        seen.push_back(s.state().tasks[t1].same_robot_retry_feasible);
+      }
+    }
+  } mover;
+  mover.m = &m;
+  mover.t1 = t1;
+  mover.t2 = t2;
+  Simulator sim(m, Plan::initial(m), blocked_chain(m, 0, true));
+  sim.run(&mover);
+  EXPECT_EQ(mover.seen, (std::vector<bool>{true, false}));
+}
+

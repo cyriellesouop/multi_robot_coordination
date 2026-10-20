@@ -69,6 +69,7 @@ Simulator::Simulator(const Mission & mission, Plan plan, WorldConfig config)
   breakdown_done_.assign(config_.deviations.size(), false);
   clear_ms_.assign(config_.deviations.size(), kUnreachable);
   deadline_reported_.assign(n, false);
+  persistent_pair_.assign(n * mission_.robot_count(), false);
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -239,6 +240,12 @@ TimeMs Simulator::next_event_time() const
     const TaskRuntime & task = state_.tasks[j];
     if (task.status == TaskStatus::kUnstarted && task.release_ms > now) {next = std::min(next, task.release_ms);}
   }
+  // An edit to install.
+  for (const PendingEdit & e : pending_edits_) {next = std::min(next, std::max(e.activation_ms, now + 1));}
+  // A wake-up requested by the controller.
+  for (const TimeMs w : wakeups_) {
+    if (w > now) {next = std::min(next, w);}
+  }
   // A deadline still to be reported (a task not completed by it).
   for (Index j = 0; j < state_.tasks.size(); ++j) {
     const TimeMs d = mission_.task(j).deadline_ms;
@@ -256,9 +263,14 @@ bool Simulator::step(SimulationObserver * observer)
   if (started_) {
     t = next_event_time();
     if (!is_reachable(t) || t > config_.horizon_ms) {
-      // The run is over: an attempt still running or blocked is incomplete.
+      // The run is over: an attempt still running or blocked is incomplete; a task that had
+      // attempts but is unstarted again (cancelled or reset by a repair) is unstarted at the end.
       for (Index j = 0; j < attempts_.size(); ++j) {
-        if (attempts_[j].active) {records_[j].status = FinalStatus::kIncomplete;}
+        if (attempts_[j].active) {
+          records_[j].status = FinalStatus::kIncomplete;
+        } else if (state_.tasks[j].status == TaskStatus::kUnstarted && records_[j].attempts > 0) {
+          records_[j].status = FinalStatus::kUnstartedAtEnd;
+        }
       }
       finished_ = true;
       return false;
@@ -266,6 +278,9 @@ bool Simulator::step(SimulationObserver * observer)
   }
   started_ = true;
   state_.now_ms = t;
+  // Wake-ups up to now are consumed by this step.
+  wakeups_.erase(std::remove_if(wakeups_.begin(), wakeups_.end(), [t](TimeMs w) {return w <= t;}),
+    wakeups_.end());
 
   // 1. Attempts that end now (completions before breakdowns: a robot that finishes exactly when
   //    it breaks down has finished).
@@ -311,9 +326,12 @@ bool Simulator::step(SimulationObserver * observer)
       state_.tasks[j].remaining_ms = sample.remaining_ms;
       if (sample.blocked) {
         // The robot reports whether its own retry could work (transient vs persistent cause).
+        // The diagnostic belongs to this (task, robot) pair and is remembered for it.
+        const Index r = plan_.robot_of(j);
         for (const InjectedDeviation & d : config_.deviations) {
           if (d.type == DeviationType::kDelay && d.task == j) {
             state_.tasks[j].same_robot_retry_feasible = !d.persistent;
+            if (d.persistent) {persistent_pair_[j * mission_.robot_count() + r] = true;}
           }
         }
       }
@@ -321,7 +339,26 @@ bool Simulator::step(SimulationObserver * observer)
     }
   }
 
-  // 5. Start everything that can start now.
+  // 5. Install the scheduled edits whose activation time has come (in scheduling order). An edit
+  //    is rejected if one of its tasks completed before activation, or if it no longer fits.
+  std::vector<PendingEdit> due;
+  for (auto it = pending_edits_.begin(); it != pending_edits_.end(); ) {
+    if (it->activation_ms <= t) {
+      due.push_back(std::move(*it));
+      it = pending_edits_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  for (const PendingEdit & e : due) {
+    const bool installed = install(e.plan, e.edited, t, nullptr) == EditOutcome::kInstalled;
+    if (observer) {observer->on_edit_installed(installed, t);}
+  }
+
+  // 6. The controller decides (hold, edit the plan) with everything it was told at t.
+  if (observer) {observer->act(*this);}
+
+  // 7. Start everything that can start now.
   dispatch(t);
   return true;
 }
@@ -336,6 +373,101 @@ void Simulator::set_held(const std::vector<Index> & tasks)
 {
   held_.assign(held_.size(), false);
   for (const Index j : tasks) {held_.at(j) = true;}
+}
+
+void Simulator::request_wakeup(TimeMs t)
+{
+  if (t > state_.now_ms) {wakeups_.push_back(t);}
+}
+
+void Simulator::schedule_edit(const Plan & new_plan, const std::vector<Index> & edited, TimeMs activation_ms)
+{
+  ++edit_counts_.scheduled;
+  if (activation_ms <= state_.now_ms) {
+    apply_edit(new_plan, edited, state_.now_ms);  // no latency: install now (throws if invalid)
+    return;
+  }
+  pending_edits_.push_back({new_plan, edited, activation_ms});
+}
+
+void Simulator::apply_edit(const Plan & new_plan, const std::vector<Index> & edited, TimeMs release_ms)
+{
+  std::string error;
+  if (install(new_plan, edited, release_ms, &error) != EditOutcome::kInstalled) {
+    throw std::invalid_argument(error);
+  }
+}
+
+Simulator::EditOutcome Simulator::install(
+  const Plan & new_plan, const std::vector<Index> & edited, TimeMs release_ms, std::string * error)
+{
+  // Reason 1: an edited task has completed (e.g. before the activation of a scheduled edit).
+  for (const Index j : edited) {
+    if (j < state_.tasks.size() && state_.tasks[j].status == TaskStatus::kCompleted) {
+      ++edit_counts_.rejected_task_completed;
+      if (error) {*error = "edit: '" + mission_.task(j).id + "' is already completed";}
+      return EditOutcome::kTaskCompleted;
+    }
+  }
+  // Reason 2: anything else that makes the edit invalid.
+  try {
+    install_or_throw(new_plan, edited, release_ms);
+  } catch (const std::invalid_argument & e) {
+    ++edit_counts_.rejected_invalid;
+    if (error) {*error = e.what();}
+    return EditOutcome::kInvalid;
+  }
+  ++edit_counts_.installed;
+  return EditOutcome::kInstalled;
+}
+
+void Simulator::install_or_throw(const Plan & new_plan, const std::vector<Index> & edited, TimeMs release_ms)
+{
+  const std::size_t n = mission_.task_count();
+  const TimeMs now = state_.now_ms;
+  if (new_plan.task_count() != n) {throw std::invalid_argument("apply_edit: plan of another mission");}
+  release_ms = std::max(release_ms, now);
+
+  // 1. Build the new observable state on a COPY, so an invalid edit changes nothing.
+  std::vector<bool> is_edited(n, false);
+  RuntimeState next = state_;
+  for (const Index j : edited) {
+    if (j >= n) {throw std::invalid_argument("apply_edit: task index out of range");}
+    if (state_.tasks[j].status == TaskStatus::kCompleted) {
+      throw std::invalid_argument("apply_edit: '" + mission_.task(j).id + "' is already completed");
+    }
+    is_edited[j] = true;
+    // Retry diagnostic: same robot -> keep it; another robot -> that pair's own diagnostic.
+    const Index new_robot = new_plan.robot_of(j);
+    const bool diagnostic = new_robot == plan_.robot_of(j) ? state_.tasks[j].same_robot_retry_feasible :
+      !persistent_pair_[j * mission_.robot_count() + new_robot];
+    next.tasks[j] = TaskRuntime{};  // unstarted again (cancelled, retried or just moved)
+    next.tasks[j].release_ms = release_ms;
+    next.tasks[j].same_robot_retry_feasible = diagnostic;
+  }
+  for (Index j = 0; j < n; ++j) {
+    if (attempts_[j].active && !is_edited[j] && new_plan.robot_of(j) != plan_.robot_of(j)) {
+      throw std::invalid_argument(
+              "apply_edit: running task '" + mission_.task(j).id + "' cannot change robot without restarting");
+    }
+  }
+  // 2. The new queues must fit the state (finished tasks first, at most one running task, then
+  //    unstarted ones): the Predictor checks exactly that and throws otherwise.
+  const DurationSnapshot durations = DurationSnapshot::capture(mission_, ConfigDurationModel{}, next);
+  const Predictor check(mission_, new_plan, next, durations);
+  (void)check;
+
+  // 3. Commit: cancel the running edited attempts (their progress is lost), then switch.
+  for (const Index j : edited) {
+    Attempt & a = attempts_[j];
+    if (!a.active) {continue;}
+    a.active = false;
+    records_[j].discarded_work_ms += worked_ms(a, now);
+    records_[j].wasted_elapsed_ms += now - a.start_ms;
+    records_[j].status = FinalStatus::kUnstartedAtEnd;  // until it is dispatched again
+  }
+  state_ = std::move(next);
+  plan_ = new_plan;
 }
 
 }  // namespace dwafp

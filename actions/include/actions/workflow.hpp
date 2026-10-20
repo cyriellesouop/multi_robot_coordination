@@ -197,9 +197,10 @@ struct TaskRuntime
   // is part of the prediction: it costs nothing when the task would wait for its inputs anyway,
   // and it can make an upstream repair too late.
   TimeMs release_ms{0};
-  // Whether the SAME robot could try this task again now: true when the cause of the deviation or
-  // failure is expected to clear (transient), false when it is expected to persist FOR THAT ROBOT
-  // (persistent). This is a RUNTIME property, different from Subtask::retryable (restarting is
+  // Whether the SAME robot (the task's current robot) could try this task again now: true when the
+  // cause of the deviation or failure is expected to clear (transient), false when it is expected
+  // to persist FOR THAT ROBOT-TASK PAIR (persistent). When the task moves to another robot, the
+  // diagnostic of the new pair applies. This is a RUNTIME property, different from Subtask::retryable (restarting is
   // logically safe): a navigation task may be restartable, but retrying it while the same
   // obstacle is still there gives the same failure. false excludes same-robot retry only:
   // "persistent" does not mean the task is infeasible for every robot, and substitution remains
