@@ -202,7 +202,9 @@ bool MethodController::try_preventive(Simulator & sim, const std::vector<Index> 
     const RuntimeState actual = observed(sim);
     const DurationSnapshot p = DurationSnapshot::capture(mission_, ConfigDurationModel{}, actual);
     const RuntimeState expected = expected_state(mission_, sim.plan(), actual, reference_, tasks, {});
-    d = decide(mission_, sim.plan(), expected, actual, p, repair_config());
+    RepairConfig rc = repair_config();
+    rc.deviating_tasks = tasks;  // source-only edits only these (not the overdue descendants)
+    d = decide(mission_, sim.plan(), expected, actual, p, rc);
   } catch (const std::invalid_argument &) {
     ++stats_.errors;
     return false;
@@ -215,7 +217,12 @@ bool MethodController::try_preventive(Simulator & sim, const std::vector<Index> 
     case DecisionStatus::kRepair: break;
   }
   ++stats_.preventive_repairs;
-  schedule(sim, d.stage1.admissible[*d.stage1.best]);
+  const RepairCandidate & chosen = d.stage1.admissible[*d.stage1.best];
+  // Repair location: a deviating task itself, or a task downstream of it (repair-location study).
+  // Compared with the deviating tasks, not with d.impact.sources, which also contains the overdue
+  // descendants rebuilt by expected_state() (see RepairConfig::deviating_tasks).
+  if (std::find(tasks.begin(), tasks.end(), chosen.task) == tasks.end()) {++stats_.preventive_downstream;}
+  schedule(sim, chosen);
   return true;
 }
 

@@ -279,3 +279,47 @@ TEST(Controllers, TimeoutGoesToTheIdenticalRecoveryForEveryMethod)
   }
 }
 
+
+// Downstream repair (repair-location study). T1 (robot1, no real deadline) -> T2 (robot2, d 13 s).
+// T1 is held up for 3 s at 80 % of its work (4 s in, transient), so it really ends at 8 s and T2
+// on robot2 (7.5 s) would end at 15.5 s: late.
+//   source-only: when T1's trigger fires (about 5.5 s), no edit of T1 helps (restart on robot3
+//   ends >= 9.5 s, then T2 on robot2 >= 17 s; a retry is later still). T2 starts late on robot2
+//   at 8 s; once T2's own feedback deviates, source-only may edit T2 (now a deviating task), but
+//   restarting it elsewhere ends at >= 13.5 s: too late. T2 misses its deadline.
+//   DWAFP: at T1's trigger, T2 is downstream and unstarted: it moves T2 to robot1, right after T1
+//   (5 s there, the first preventive candidate in generation order): T1 continues (no work thrown
+//   away) and ends at 8 s, T2 runs 8-13 s on robot1, on time. It is counted as a downstream edit.
+// Mission-wide makes the same choice (T1 first in its list, but no edit of T1 is preventive).
+TEST(Controllers, DwafpRepairsDownstreamWhereSourceOnlyCannot)
+{
+  const Mission m = inline_mission(
+    "{mission_id: downstream, subtasks: [{id: T1, robot: robot1, deadline_sec: 60},"
+    " {id: T2, robot: robot2, deadline_sec: 13, predecessors: [T1]}]}");
+  const Index t1 = m.task_index("T1");
+  const Index t2 = m.task_index("T2");
+  WorldConfig world;
+  world.horizon_ms = 120000;
+  world.timeout_multiplier = 2.0;
+  world.deviations.push_back({DeviationType::kDelay, t1, dwafp::kNoIndex, 0.8, 0, 3000, false});
+
+  const Outcome source_only = run(m, world, Method::kSourceOnly);
+  EXPECT_EQ(source_only.stats.preventive_repairs, 0);    // no edit of a deviating task protects T2
+  EXPECT_EQ(source_only.stats.preventive_downstream, 0);
+  EXPECT_EQ(source_only.records[t1].end_ms, 8000);
+  EXPECT_FALSE(source_only.records[t2].deadline_ok);
+
+  for (const Method method : {Method::kDwafp, Method::kMissionWide}) {
+    const Outcome o = run(m, world, method);
+    SCOPED_TRACE(dwafp::method_name(method));
+    EXPECT_EQ(o.stats.preventive_repairs, 1);
+    EXPECT_EQ(o.stats.preventive_downstream, 1);         // the edit moved T2, not the source
+    EXPECT_EQ(o.records[t1].robot, m.robot_index("robot1"));
+    EXPECT_EQ(o.records[t1].end_ms, 8000);
+    EXPECT_EQ(o.records[t1].discarded_work_ms, 0);        // the source's progress is kept
+    EXPECT_EQ(o.records[t2].robot, m.robot_index("robot1"));
+    EXPECT_EQ(o.records[t2].start_ms, 8000);
+    EXPECT_EQ(o.records[t2].end_ms, 13000);
+    EXPECT_TRUE(o.records[t2].deadline_ok);
+  }
+}

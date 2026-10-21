@@ -75,6 +75,10 @@ struct ControllerStats
   int analyses{0};             // decide() calls (one per trigger event batch)
   int continued{0};            // ... nothing newly threatened
   int preventive_repairs{0};   // ... a preventive repair was scheduled
+  // ... of which the edited task is NOT a deviating task (one whose feedback fired the trigger): a
+  // downstream edit (a dependency or queue successor on a path to a threatened task). Always 0
+  // for source-only.
+  int preventive_downstream{0};
   int no_feasible_local{0};    // ... certificate: no permitted local repair
   int no_single_edit{0};       // ... no preventive single edit
   int fallback_events{0};      // tasks handed to the common recovery (failures, breakdowns, misses)

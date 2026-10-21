@@ -173,7 +173,13 @@ struct ImpactAnalysis
 {
   Prediction expected;          // prediction of the expected state (baseline, full propagation)
   Prediction updated;           // prediction of the actual state (incremental from `expected`)
-  std::vector<Index> sources;   // subtasks whose own inputs differ between the two states
+  // Subtasks whose own inputs differ between the two states: the EVENT SOURCES (the tasks whose
+  // deviation generated the event) plus the OVERDUE descendants that expected_state() rebuilds
+  // (unstarted although the reference says they should run). So this is not the event-source
+  // set: trigger-task-only repair takes the event sources from RepairConfig::deviating_tasks.
+  // Terminology: event source = generated the event; affected task = its prediction changed
+  // through propagation (horizon); threatened task = acquired a violated condition (A_i).
+  std::vector<Index> sources;
   std::vector<Index> horizon;   // subtasks whose prediction changed (deviation horizon)
   std::vector<Threat> threats;  // A_i (newly threatened tasks) with details, topological order
   std::vector<Index> threatened;  // A_i: the subtasks of `threats`

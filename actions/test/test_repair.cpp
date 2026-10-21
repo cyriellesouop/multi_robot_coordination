@@ -10,6 +10,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>  // std::find
 #include <random>
 #include <string>
 #include <vector>
@@ -612,6 +613,7 @@ TEST(StageOne, RepairScopesForTheAblation)
 
   dwafp::RepairConfig sources;
   sources.scope = dwafp::RepairScope::kSources;
+  sources.deviating_tasks = {m.task_index("T1")};  // trigger-task-only: the event source
   const Event e_src(m, s, {"T1"}, sources);
   EXPECT_EQ(e_src.stage1.generated, 3u);
   EXPECT_EQ(e_src.best().task, m.task_index("T1"));
@@ -625,6 +627,37 @@ TEST(StageOne, RepairScopesForTheAblation)
   all.scope = dwafp::RepairScope::kAllUnfinished;
   const Event e_all(m, s, {"T1"}, all);
   EXPECT_EQ(e_all.stage1.generated, 5u);
+}
+
+// Trigger-task-only repair with an OVERDUE descendant. T1 (robot1, 0-5 s nominal) is still running
+// at 5.5 s and will end at 8 s; T2 (robot2, 7.5 s, d 14 s) should have started at 5 s, so
+// expected_state() rebuilds it as running and T2 appears in impact.sources next to T1. The event
+// source is T1 only: trigger-task-only repair must edit T1 and never T2 (moving T2 is a downstream
+// edit, which only the region scope may make). Without deviating_tasks the scope is refused, so
+// no caller can fall back to impact.sources.
+TEST(StageOne, TriggerTaskOnlyIgnoresOverdueDescendants)
+{
+  const Mission m = chain(20, 14);
+  RuntimeState s = RuntimeState::initial(m);
+  s.now_ms = 5500;
+  set_executing(m, s, "T1", 0, 2500);  // 2.5 s remaining: ends at 8 s
+  const Index t1 = m.task_index("T1");
+  const Index t2 = m.task_index("T2");
+
+  const Event region(m, s, {"T1"});
+  const auto & src = region.impact.sources;
+  EXPECT_NE(std::find(src.begin(), src.end(), t2), src.end());  // T2 is an impact "source"
+
+  dwafp::RepairConfig trigger_only;
+  trigger_only.scope = dwafp::RepairScope::kSources;
+  trigger_only.deviating_tasks = {t1};
+  const Event e(m, s, {"T1"}, trigger_only);
+  EXPECT_GT(e.stage1.generated, 0u);
+  for (const auto & c : e.stage1.admissible) {EXPECT_EQ(c.task, t1);}  // never the overdue T2
+
+  dwafp::RepairConfig missing;
+  missing.scope = dwafp::RepairScope::kSources;  // no deviating_tasks
+  EXPECT_THROW(Event(m, s, {"T1"}, missing), std::invalid_argument);
 }
 
 // Soundness of the certificate on random events: whenever unprotectable_threats() is not empty,

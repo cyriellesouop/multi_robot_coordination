@@ -213,11 +213,22 @@ StageOneResult generate_single_edits(
     case RepairScope::kRegion:
       targets = impact.region;
       break;
-    case RepairScope::kSources:
-      for (const Index j : impact.sources) {
-        if (actual.tasks[j].status != TaskStatus::kCompleted) {targets.push_back(j);}
+    case RepairScope::kSources: {
+        // Trigger-task-only: exactly the given event sources (never impact.sources, which also
+        // holds overdue descendants), in topological order like the other lists.
+        const std::vector<Index> & given = config.deviating_tasks;
+        if (given.empty()) {
+          throw std::invalid_argument("repair: RepairScope::kSources needs RepairConfig::deviating_tasks");
+        }
+        for (const Index j : incumbent.topological_order()) {
+          if (std::find(given.begin(), given.end(), j) != given.end() &&
+            actual.tasks[j].status != TaskStatus::kCompleted)
+          {
+            targets.push_back(j);
+          }
+        }
+        break;
       }
-      break;
     case RepairScope::kAllUnfinished:
       for (const Index j : incumbent.topological_order()) {
         if (actual.tasks[j].status != TaskStatus::kCompleted) {targets.push_back(j);}

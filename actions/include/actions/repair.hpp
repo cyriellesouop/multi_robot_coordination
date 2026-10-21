@@ -69,7 +69,9 @@ enum class RepairPolicy
 enum class RepairScope
 {
   kRegion,         // DWAFP: tasks of the repair region V_R
-  kSources,        // source-only repair: only the deviating tasks (closest to existing approaches)
+  kSources,        // trigger-task-only ("source-only") repair: only the tasks whose deviation
+                   // generated the event (closest to existing approaches); they must be given in
+                   // RepairConfig::deviating_tasks
   kAllUnfinished   // global single-edit oracle: every unfinished task, no localization
 };
 
@@ -80,6 +82,13 @@ struct RepairConfig
   TimeMs decision_overhead_ms{0};  // T_decision: time to compute the repair
   TimeMs dispatch_overhead_ms{0};  // T_dispatch: time to cancel / send the goals
   RepairScope scope{RepairScope::kRegion};
+  // kSources only, REQUIRED (generate_single_edits throws if it is empty): the event sources, i.e.
+  // the tasks whose deviation generated the event (in closed loop, those whose feedback fired the
+  // trigger). ImpactAnalysis::sources cannot be used instead: it also contains the OVERDUE
+  // descendants that expected_state() reconstructs (unstarted although the reference says they
+  // should run), and editing those is a downstream edit, not trigger-task-only repair. There is
+  // deliberately no fallback, so that no caller can silently widen the baseline again.
+  std::vector<Index> deviating_tasks;
 };
 
 // One primitive repair pi = (o, T_k, r), applied and evaluated.

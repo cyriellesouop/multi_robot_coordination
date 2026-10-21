@@ -4,7 +4,19 @@ Living document: every result that may go into the paper, with its configuration
 file and the command that reproduces it. Newest results are added to the relevant section; the
 "Claims" table at the end says what each result supports.
 
-Last update: 2026-10-21 (Step 6 sweeps added: Section 1.8).
+Last update: 2026-10-21 (source-only baseline corrected: now trigger-task-only).
+
+> **Correction (2026-10-21).** Until this date, the source-only baseline could also edit
+> *overdue descendants* of the deviating task: tasks that the reference says should already have
+> started. The impact analysis rebuilds them in the expected state, so they appeared among the
+> impact "sources", and source-only edited every impact source. The baseline is now
+> **trigger-task-only (source-only)** repair: edits restricted to the task whose feedback generated
+> the trigger, as documented. The code requires that task explicitly and refuses the scope without
+> it, so no caller can fall back to the wider set. Every closed-loop result involving source-only
+> was re-run (1.4, 1.5, 1.8). Results of no intervention, reactive, DWAFP and mission-wide are
+> unchanged, run for run. The open-loop Stage I ablation (Section 2) was re-run too and is
+> unchanged (identical counts). The corrected baseline is weaker, and DWAFP now beats it on
+> transient delays (1.4, 1.8).
 
 ---
 
@@ -55,6 +67,11 @@ Delays have a warning, so they test **prevention**. Sudden failures have none, s
 
 **The methods** compared are defined in 1.1. "Baseline" means the method DWAFP is compared with.
 
+**Tasks around a deviation.** *Event source*: the task whose deviation generated the event (its
+feedback fired the trigger). *Affected task*: a task whose prediction changed through
+propagation. *Threatened task*: a task that acquired a violated condition (deadline, input or
+robot); the set A_i. A *downstream edit* edits a task other than the event source.
+
 **Columns and terms.**
 
 | Term | Meaning |
@@ -89,7 +106,7 @@ same mission, plan, deviation and noise (paired comparison):
 |---|---|---|
 | No intervention | none | none |
 | Reactive | none | common recovery |
-| Source-only | edits restricted to the deviating task | common recovery |
+| Trigger-task-only (source-only) | edits restricted to the event source (the task whose feedback generated the trigger) | common recovery |
 | **DWAFP** | edits inside the repair region | common recovery |
 | Mission-wide | edits on any unfinished task | common recovery |
 
@@ -182,13 +199,20 @@ DWAFP better), its interval, then W / T / L. "200 ties" = identical outcome in e
 
 | Deviation | DWAFP − source-only, no noise | DWAFP − source-only, 10 % noise | DWAFP − mission-wide (both) |
 |---|---|---|---|
-| Transient delay | −0.02 [−0.06, 0.00], 2 / 198 / 0 | −0.03 [−0.07, +0.01], 4 / 195 / 1 | 0.00, 200 ties |
-| Persistent obstruction | 0.00, 200 ties | −0.02 [−0.07, +0.01], 2 / 197 / 1 | 0.00, 200 ties |
-| Outcome failure | 0.00, 200 ties | −0.01 [−0.03, +0.01] | 0.00, 200 ties |
-| Robot breakdown | 0.00, 200 ties | −0.04 [−0.09, 0.00] | 0.00, 200 ties |
+| Transient delay | **−0.10** [−0.15, −0.04], 14 / 186 / 0 | **−0.10** [−0.17, −0.04], 12 / 187 / 1 | 0.00, 200 ties |
+| Persistent obstruction | 0.00, 200 ties | −0.01 [−0.07, +0.02], 2 / 196 / 2 | 0.00, 200 ties |
+| Outcome failure | 0.00, 200 ties | −0.01 [−0.03, +0.01], 3 / 196 / 1 | 0.00, 200 ties |
+| Robot breakdown | 0.00, 200 ties | −0.04 [−0.09, 0.00], 3 / 197 / 0 | 0.00, 200 ties |
+| Mix 35/25/25/15 | −0.04 [−0.09, −0.01], 4 / 196 / 0 | −0.04 [−0.09, 0.00], 6 / 192 / 2 | 0.00, 200 ties |
 
-- **DWAFP ≈ source-only** in this configuration (deadlines on every task): the best edit is almost
-  always on the deviating task itself. Not yet evidence for repair at alternative locations.
+Success under a transient delay: source-only 80 %, DWAFP 86 % (no noise).
+
+- **Transient delays: DWAFP beats source-only** (14 wins, no loss). When the source cannot be moved
+  usefully, DWAFP can still edit a task downstream of it, typically before that task starts.
+  Source-only can act on that task only once the task itself runs late, which is often too late.
+- **Persistent obstructions: identical.** The obstructed source never finishes on its robot, so
+  its output exists only if the source itself moves; no single edit of a descendant can restore
+  it. Both methods find that move.
 - **DWAFP = mission-wide** in all 2000 paired runs. State it narrowly: *"In the evaluated
   single-deviation scenarios, restricting edits to the repair region did not exclude the candidate
   selected by mission-wide single-edit search."*
@@ -206,23 +230,25 @@ differences in misses against reactive and against source-only.
 
 | Deviation | Source class | n | DWAFP − reactive [95 % CI] | DWAFP − source-only [95 % CI] |
 |---|---|---|---|---|
-| Transient delay | downstream dependency (same robot) | 41 | −0.20 [−0.39, −0.05] | 0.00 |
-| | cross-robot handoff | 159 | −0.38 [−0.52, −0.25] | −0.03 [−0.08, 0.00] |
+| Transient delay | downstream dependency (same robot) | 41 | −0.20 [−0.39, −0.05] | −0.05 [−0.12, 0.00] |
+| | cross-robot handoff | 159 | −0.38 [−0.52, −0.25] | **−0.11** [−0.18, −0.04] |
 | Persistent obstruction | downstream dependency (same robot) | 41 | −1.15 [−1.71, −0.66] | 0.00 |
 | | cross-robot handoff | 159 | −2.30 [−2.75, −1.86] | 0.00 |
 
-The preventive gain is about twice as large when the consequences cross robots.
+The preventive gain is about twice as large when the consequences cross robots, against reactive
+and against source-only alike.
 
 ### 1.6 Decision latency (per decision, no noise, µs)
 
 Rows: deviation types. Columns: the per-decision time percentiles of DWAFP, then of mission-wide
-search (wall clock on the development PC, microseconds; 1000 µs = 1 ms).
+search (wall clock on the development PC, microseconds; 1000 µs = 1 ms; they vary slightly from
+run to run, the values below are those of the committed `main_noise0.txt`).
 
 | Deviation | DWAFP p50 / p95 / p99 | Mission-wide p50 / p95 / p99 |
 |---|---|---|
-| Transient delay | 15 / 32 / 317 | 15 / 32 / 623 |
-| Persistent obstruction | 54 / 729 / 1043 | 53 / 924 / 1210 |
-| Mix | 16 / 141 / 682 | 16 / 387 / 783 |
+| Transient delay | 16 / 34 / 341 | 16 / 33 / 618 |
+| Persistent obstruction | 52 / 683 / 964 | 51 / 879 / 1047 |
+| Mix | 16 / 140 / 665 | 16 / 371 / 772 |
 
 All decisions are around or below 1 ms on 20-task missions. The difference between local and
 mission-wide search is small at this size; it must be measured at larger task counts (Step 6).
@@ -247,38 +273,48 @@ DWAFP better) with 95 % CI and W / T / L; harmful / unneeded DWAFP runs. DWAFP �
 
 | Deadlines | Deviation | Success R / S / D | Miss rate R / D | DWAFP − reactive | DWAFP − source-only | Harm / unneeded |
 |---|---|---|---|---|---|---|
-| every task | transient delay | 70 / 86 / 86 % | 2.9 / 1.2 % | −0.34 [−0.47, −0.23], 39/161/0 | −0.02 [−0.06, 0.00], 2/198/0 | 0 / 0 |
+| every task | transient delay | 70 / 80 / 86 % | 2.9 / 1.2 % | −0.34 [−0.47, −0.23], 39/161/0 | **−0.10** [−0.15, −0.04], 14/186/0 | 0 / 0 |
 | every task | persistent obstruction | 8 / 65 / 65 % | 18.4 / 8.1 % | −2.06 [−2.46, −1.70], 115/85/0 | 0.00, 200 ties | 0 / 0 |
-| handoff + final | transient delay | 78 / 90 / 91 % | 3.0 / 0.9 % | −0.24 [−0.34, −0.15], 31/169/0 | −0.01 [−0.04, 0.00], 1/199/0 | 0 / 0 |
+| handoff + final | transient delay | 78 / 87 / 91 % | 3.0 / 0.9 % | −0.24 [−0.34, −0.15], 31/169/0 | **−0.06** [−0.10, −0.03], 10/190/0 | 0 / 0 |
 | handoff + final | persistent obstruction | 20 / 79 / 79 % | 20.8 / 6.3 % | −1.58 [−1.91, −1.28], 117/83/0 | 0.00, 200 ties | 0 / 0 |
 
 (Sudden failures and breakdowns: 200 ties against reactive and source-only in both structures.)
 
 Per shape (delays): the gain over reactive holds for every shape, largest for fork-join
 (persistent: −3.37 every task, −2.94 handoff + final) and smallest for rendezvous (−0.71 / −0.58).
-Against source-only, the only intervals that exclude 0 are small: −0.04 to −0.07 misses per run
-for transient delays on random DAG, chains and fork-join (4–5 wins, 0 losses); persistent: 200
-ties in every shape. Rendezvous is the weakest shape: the transient gain over reactive is small
-(−0.10 / −0.09), DWAFP loses 1 scenario to reactive and 1 to source-only, and 1–4 of its runs
-are harmful (an edit on a rendezvous partner can delay the meeting).
+Against source-only, every shape gains on transient delays (DWAFP − source-only, every task /
+handoff + final):
 
-**Finding.** Handoff-and-final deadlines did **not** create a gap between DWAFP and source-only
-repair. In these workflows the most effective single edit after a delay is to move the delayed
-task itself; repairing elsewhere rarely adds anything. The claim "dependency-aware repair
-outperforms source-only repair" remains unsupported (see 3 and 5).
+| Shape | Every task | Handoff + final |
+|---|---|---|
+| random DAG | −0.17 [−0.28, −0.09], 16/184/0 | −0.12 [−0.22, −0.05], 13/187/0 |
+| chains | −0.15 [−0.23, −0.08], 19/181/0 | −0.04 [−0.07, −0.01], 6/194/0 |
+| fork-join | −0.14 [−0.23, −0.07], 16/184/0 | −0.14 [−0.21, −0.07], 16/184/0 |
+| rendezvous | −0.06 [−0.10, −0.03], 12/187/1 | −0.05 [−0.09, −0.02], 11/188/1 |
+
+Persistent: 200 ties against source-only in every shape. Rendezvous is the weakest shape: the
+transient gain over reactive is small (−0.10 / −0.09), DWAFP loses 1 scenario to reactive and 1 to
+source-only, and 1–4 of its runs are harmful (an edit on a rendezvous partner can delay the
+meeting).
+
+**Finding.** With the corrected baseline, DWAFP beats source-only on transient delays in every
+shape and both deadline structures, with at most 1 loss per 200 scenarios. Handoff-and-final
+deadlines do not enlarge the gap. Which conditions make downstream edits matter is the subject of
+the repair-location study (pending, Section 5).
 
 #### Duration noise
 
-| Noise | Transient: DWAFP − reactive | Persistent: DWAFP − reactive | Failure / breakdown: DWAFP − reactive | DWAFP − source-only (delays) | Unneeded (transient) |
+| Noise | Transient: DWAFP − reactive | Persistent: DWAFP − reactive | Failure / breakdown: DWAFP − reactive | DWAFP − source-only (transient / persistent) | Unneeded (transient) |
 |---|---|---|---|---|---|
-| 0 % | −0.34 [−0.47, −0.23] | −2.06 [−2.46, −1.70] | 0.00 / 0.00 | −0.02 / 0.00 | 0 |
-| 5 % | −0.34 [−0.46, −0.24] | −2.12 [−2.52, −1.76] | −0.03 / −0.04 | −0.03 / −0.01 | 3 |
-| 10 % | −0.34 [−0.47, −0.24] | −2.10 [−2.50, −1.74] | −0.06 / −0.06 | −0.03 / −0.02 | 7 |
-| 20 % | −0.39 [−0.52, −0.28] | −1.95 [−2.33, −1.57] | −0.17 / −0.20 | 0.00 / −0.06 | 7 |
+| 0 % | −0.34 [−0.47, −0.23] | −2.06 [−2.46, −1.70] | 0.00 / 0.00 | **−0.10** / 0.00 | 0 |
+| 5 % | −0.34 [−0.46, −0.24] | −2.12 [−2.52, −1.76] | −0.03 / −0.04 | **−0.10** / −0.01 | 3 |
+| 10 % | −0.34 [−0.47, −0.24] | −2.10 [−2.50, −1.74] | −0.06 / −0.06 | **−0.10** / −0.01 | 7 |
+| 20 % | −0.39 [−0.52, −0.28] | −1.95 [−2.33, −1.57] | −0.17 / −0.20 | **−0.17** / **−0.14** | 7 |
 
-The preventive gain on delays is stable up to 20 % noise. With noise DWAFP loses a few
-scenarios (at most 2 / 200 to reactive, at most 4 / 200 to source-only, every interval against
-source-only containing 0). The growing gain on failures and
+The preventive gain on delays is stable up to 20 % noise, and so is the gain over source-only on
+transient delays (every interval excludes 0; at 20 % also on persistent obstructions,
+−0.14 [−0.24, −0.04]). With noise DWAFP loses a few scenarios (at most 2 / 200 to reactive, at most
+3 / 200 to source-only). The growing gain on failures and
 breakdowns comes from preventing noise-induced delays, not from the injected event. Unneeded
 interventions stay rare (at most 7 / 200); harmful ones at most 4 / 200 (20 %, breakdowns).
 
@@ -286,25 +322,25 @@ interventions stay rare (at most 7 / 200); harmful ones at most 4 / 200 (20 %, b
 
 | Latency | Transient: DWAFP − reactive | Persistent: DWAFP − reactive | Persistent success R / D | Transient: DWAFP − source-only |
 |---|---|---|---|---|
-| 0 s | −0.34 [−0.47, −0.23] | −2.06 [−2.46, −1.70] | 8 / 65 % | −0.02 [−0.06, 0.00] |
-| 1 s | −0.36 [−0.49, −0.24] | −1.59 [−1.95, −1.27] | 5 / 48 % | −0.02 [−0.06, 0.00] |
-| 3 s | −0.33 [−0.47, −0.20] | −1.11 [−1.47, −0.79] | 2 / 26 % | **−0.06 [−0.10, −0.01], 7/193/0** |
+| 0 s | −0.34 [−0.47, −0.23] | −2.06 [−2.46, −1.70] | 8 / 65 % | −0.10 [−0.15, −0.04], 14/186/0 |
+| 1 s | −0.36 [−0.49, −0.24] | −1.59 [−1.95, −1.27] | 5 / 48 % | −0.12 [−0.20, −0.07], 17/183/0 |
+| 3 s | −0.33 [−0.47, −0.20] | −1.11 [−1.47, −0.79] | 2 / 26 % | **−0.23 [−0.35, −0.12], 24/176/0** |
 
 Latency hurts prevention of persistent obstructions (the rescued task starts later), but the gain
-over reactive remains significant at 3 s. With 3 s of latency, DWAFP beats source-only on transient
-delays in 7 scenarios and never loses: downstream edits can absorb the latency (their task waits
-for its inputs anyway), which edits of the source cannot. This is the first condition where
-alternative repair locations matter (small effect).
+over reactive remains significant at 3 s. The gain over source-only on transient delays grows with
+latency (−0.10 → −0.12 → −0.23, never a loss): downstream edits can absorb the latency (their task
+waits for its inputs anyway), which edits of the source cannot.
 
 #### Remaining-time estimator while blocked
 
 | Estimator | Transient: DWAFP − reactive | Persistent: DWAFP − reactive | Transient: DWAFP − source-only | Unneeded (transient) |
 |---|---|---|---|---|
-| nominal (primary) | −0.34 [−0.47, −0.23] | −2.06 [−2.46, −1.70] | −0.02, 2/198/0 | 0 |
-| conservative | −0.35 [−0.48, −0.25] | −2.06 [−2.46, −1.70] | +0.01, 1/197/2 | 12 |
+| nominal (primary) | −0.34 [−0.47, −0.23] | −2.06 [−2.46, −1.70] | −0.10 [−0.15, −0.04], 14/186/0 | 0 |
+| conservative | −0.35 [−0.48, −0.25] | −2.06 [−2.46, −1.70] | −0.04 [−0.10, +0.01], 9/189/2 | 12 |
 
-The benefit does not depend on the estimation assumption. The conservative estimate adds 12
-unneeded interventions for transient delays and 2 losses against source-only, which supports the
+The benefit over reactive does not depend on the estimation assumption. The conservative estimate
+adds 12 unneeded interventions for transient delays and makes the gain over source-only smaller and
+not significant (2 losses), which supports the
 nominal estimate as the primary configuration. Persistent obstructions are unaffected, since both
 estimators use the robot's explicit diagnostic.
 
@@ -320,7 +356,8 @@ For persistent obstructions the gain over reactive grows with the timeout: the l
 declaring failure, the later reactive recovery starts, while DWAFP acts on the feedback either way.
 A tight budget (1.5) turns many transient delays into timeouts for every method (success 51–56 %)
 and halves the transient gain (λ = 3 changes nothing for transient delays, which end before 2×); DWAFP then loses 2 of 200 scenarios. The gain remains significant
-for every λ. λ = 2 is used for the main results without tuning it for any method.
+for every λ. λ = 2 is used for the main results without tuning it for any method. Against
+source-only on transient delays: −0.06 [−0.14, +0.01] (12/183/5) at λ = 1.5, −0.10 at λ = 2 and 3.
 
 ---
 
@@ -361,7 +398,7 @@ One row per claim the paper may make. Evidence: the sections supporting it. Stat
 | The benefit is robust to duration noise | 1.3, 1.8: stable from 0 to 20 % noise | **Supported** |
 | The benefit does not depend on the blockage estimator | 1.8: nominal and conservative give the same gains | **Supported** (nominal has fewer unneeded edits) |
 | The gain over reactive depends on the execution timeout | 1.8: −1.15 / −2.06 / −3.00 for λ = 1.5 / 2 / 3 (persistent) | **Reported** (λ = 2 untuned) |
-| Dependency-aware repair outperforms source-only repair | 1.4, 1.8: nearly identical, also with handoff-and-final deadlines; small gain only with 3 s latency (−0.06, 7/193/0) | **Not supported** in the tested workflows |
+| Dependency-aware repair outperforms trigger-task-only repair | 1.4: −0.10 [−0.15, −0.04] (14/186/0) on transient delays; 1.8: every shape, deadline structure, noise level and latency | **Supported for transient delays**; persistent obstructions: identical by construction (1.4) |
 | Local search preserves global single-edit quality | 1.4: 2000 ties; 2: 100 % kept | **Promising** (single-deviation scenarios only) |
 | Local search substantially reduces computation | 1.6: small difference at 20 tasks; 2: −40 % candidates | **Pending** (closed-loop scaling) |
 | No harmful or unneeded preventive edits | 1.2: none without noise; 1.3: 7 unneeded / 200 transient runs with noise | **Supported**, with the noise caveat |
@@ -372,7 +409,7 @@ One row per claim the paper may make. Evidence: the sections supporting it. Stat
 
 1. **Persistent obstruction gain depends on the robot's diagnostic.** *"The robot reports whether
    same-robot retry remains feasible; DWAFP uses this information before the execution timeout."*
-   Estimator sensitivity (nominal vs conservative) is pending.
+   The gain does not depend on the remaining-time estimator (1.8), only on this diagnostic.
 2. **Mission-wide equality is empirical, not a guarantee** (see the sentence in 1.4).
 3. **Shared recovery can be harmful in rare breakdown cases** (3 / 200 runs, every repair-enabled
    method alike): it inserts the stranded tasks at the front of other robots' queues, which can
@@ -385,11 +422,14 @@ One row per claim the paper may make. Evidence: the sections supporting it. Stat
 
 ## 5. Pending (Step 6)
 
-Done (1.8): deadline structure, noise sweep, dispatch latency, estimator, execution timeout.
+Done: deadline structure, noise sweep, dispatch latency, estimator, execution timeout (1.8).
 
 Still to run:
-1. Closed-loop scaling with homogeneous rates or R ∈ {3, 6, 9, 12}.
-2. Failure taxonomy of the events DWAFP cannot prevent (7 classes, with a pair oracle).
-3. Conditions where repairing at other locations should matter (to test the remaining claim
-   directly): a source late in its progress (moving it discards most of the work), a busy fleet
-   (few idle robots), larger dispatch latency, and very heterogeneous robot speeds.
+1. Repair-location factorial study: when do downstream edits matter (final-only deadlines, source
+   progress, idle-spare availability, execution-time ratio, slack, the same latency for every
+   method)?
+2. Closed-loop scaling, weak scaling N = qR with R ∈ {3, 6, 9, 12} and q ≈ 5 or 10 tasks per robot,
+   homogeneous rates (optionally fixed N with varying R): region share, validation-horizon share,
+   candidates per decision for DWAFP and mission-wide, decision-time p50 / p95 / p99, miss
+   difference DWAFP − mission-wide; release build, with processor, compiler and optimization flags.
+3. Failure taxonomy of the events DWAFP cannot prevent (7 classes, with a pair oracle).

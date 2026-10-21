@@ -394,6 +394,7 @@ void ablation(const char * title, const EventSet & set, bool retry_feasible, Tim
     ++need;
     RepairConfig rc;
     rc.dispatch_overhead_ms = latency;
+    rc.deviating_tasks = {e.source};  // trigger-task-only: the event source, not impact.sources
     if (!unprotectable_threats(m, rm.plan, actual, p, impact, rc).empty()) {++certified;}
     const auto & a = impact.threatened;
     if (std::find(a.begin(), a.end(), e.source) != a.end()) {++source_threatened;}
