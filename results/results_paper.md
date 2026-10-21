@@ -33,6 +33,47 @@ results.
 
 ---
 
+## How to read the tables
+
+**Rows.** Most tables have one row per **deviation type**, the single event injected into each
+scenario:
+
+| Row | What happens to the source task | Warning in the robot feedback? |
+|---|---|---|
+| Transient delay | the robot is blocked for a while (0.2–1.0 × the task's duration), then continues | yes: BLOCKED, the predicted finish slips |
+| Persistent obstruction | the robot can never get past the obstacle; another robot can still do the task | yes: BLOCKED, plus "same-robot retry not feasible" |
+| Outcome failure | the task suddenly ends without its result | no (sudden failure) |
+| Robot breakdown | a robot suddenly stops working for good | no (sudden failure) |
+| Mix 35/25/25/15 | one of the four above, drawn with these probabilities | — (overall workload) |
+
+Delays have a warning, so they test **prevention**. Sudden failures have none, so they test the
+**common recovery** and work as **controls** (the methods should be equal there).
+
+**The methods** compared are defined in 1.1. "Baseline" means the method DWAFP is compared with.
+
+**Columns and terms.**
+
+| Term | Meaning |
+|---|---|
+| Run | one scenario (mission, plan, deviation, noise) executed under one method |
+| Paired | every scenario is run under every method; a comparison uses the same scenarios for both |
+| Misses | deadline misses in one run: tasks that have a deadline and were not completed by it (a task never completed counts as a miss); lower is better |
+| A − B | mean over the 200 scenarios of (misses of A − misses of B), same scenario for both. **Negative = A is better.** Example: −0.34 = A has 0.34 fewer deadline misses per run on average |
+| [95 % CI] | bootstrap 95 % confidence interval of that mean (2000 resamples). If it does not contain 0, the difference is statistically significant; whether it **matters** also depends on its size |
+| W / T / L | wins / ties / losses over the 200 scenarios: in how many A had fewer, the same, or more misses than B. 39 / 161 / 0 = better in 39, equal in 161, worse in none |
+| Success | share of runs in which every task completed and every deadline was met |
+| Miss rate | misses / tasks that have a deadline, averaged over runs (comparable across mission sizes) |
+| Completion rate | completed tasks / all tasks, averaged over runs |
+| Completed-task tardiness | sum of (end − deadline) over the tasks that completed late, in seconds; tasks never completed are **not** in it, so read it with the completion rate |
+| Makespan | time at which the last task completed, averaged only over runs where every task completed (their number in brackets) |
+| Harmful | runs in which the method had **more** misses than no intervention at all |
+| Unneeded | runs in which the method edited the plan although no intervention would have succeeded |
+| Realized | runs in which the injected deviation actually happened (a method that moves the task before the event avoids it) |
+| n | number of scenarios in that row |
+| p50 / p95 / p99 | 50 %, 95 % and 99 % of the decisions took at most this long (one decision = one analysis and repair search) |
+
+---
+
 ## 1. Closed-loop comparison (simulator, executed outcomes)
 
 ### 1.1 Setup
@@ -72,6 +113,10 @@ bootstrap 95 % confidence interval (2000 resamples) and wins / ties / losses ove
 
 ### 1.2 Main result: DWAFP vs reactive recovery, no noise
 
+Rows: deviation types. Columns: the paired difference in misses (DWAFP − reactive, negative =
+DWAFP better) with its interval; W / T / L of DWAFP against reactive; the success rate of reactive,
+then of DWAFP; DWAFP's harmful and unneeded runs; in how many scenarios the deviation was realized.
+
 | Deviation | Misses: DWAFP − reactive [95 % CI] | W / T / L | Success: reactive → DWAFP | Harmful / unneeded (DWAFP) | Realized |
 |---|---|---|---|---|---|
 | Transient delay | **−0.34** [−0.47, −0.23] | 39 / 161 / 0 | 70 % → **86 %** | 0 / 0 | 200 / 200 |
@@ -92,7 +137,8 @@ Reading:
 - Harmful (more misses than no intervention) and unneeded (an edit in a run that would have
   succeeded without intervention) preventive edits: **none**.
 
-Other outcome metrics (no noise, means per run):
+Other outcome metrics (no noise, means per run). One row per (deviation, method); the rates and
+tardiness are averages over the 200 runs of that method:
 
 | Deviation | Method | Miss rate | Completion rate | Completed-task tardiness (s) | Makespan (s, fully completed runs) |
 |---|---|---|---|---|---|
@@ -103,6 +149,9 @@ Other outcome metrics (no noise, means per run):
 | | DWAFP | 8.1 % | 100 % | 7.13 | 60.1 (200 runs) |
 
 ### 1.3 Robustness: the same comparison with 10 % duration noise
+
+Same rows and columns as 1.2, on the same scenarios, but every task runs up to 10 % faster or slower
+than planned (the controller does not know by how much).
 
 | Deviation | Misses: DWAFP − reactive [95 % CI] | W / T / L | Success: reactive → DWAFP | Harmful / unneeded (DWAFP) |
 |---|---|---|---|---|
@@ -124,6 +173,9 @@ Suggested sentence: *"The improvement over reactive recovery is unchanged under 
 
 ### 1.4 DWAFP vs source-only and vs mission-wide repair
 
+Rows: deviation types. Each cell: the paired difference in misses (DWAFP − that method, negative =
+DWAFP better), its interval, then W / T / L. "200 ties" = identical outcome in every scenario.
+
 | Deviation | DWAFP − source-only, no noise | DWAFP − source-only, 10 % noise | DWAFP − mission-wide (both) |
 |---|---|---|---|
 | Transient delay | −0.02 [−0.06, 0.00], 2 / 198 / 0 | −0.03 [−0.07, +0.01], 4 / 195 / 1 | 0.00, 200 ties |
@@ -139,6 +191,15 @@ Suggested sentence: *"The improvement over reactive recovery is unchanged under 
 
 ### 1.5 By source class (no noise)
 
+The delay scenarios split by where the consequences of the source task can go (sudden failures are
+not split). Rows: deviation type × source class. Columns: how many scenarios (n), then the paired
+differences in misses against reactive and against source-only.
+
+| Source class | Meaning |
+|---|---|
+| downstream dependency (same robot) | tasks depend on the source, all on the source's own robot |
+| cross-robot handoff | at least one task that depends on it (directly or not) runs on another robot |
+
 | Deviation | Source class | n | DWAFP − reactive [95 % CI] | DWAFP − source-only [95 % CI] |
 |---|---|---|---|---|
 | Transient delay | downstream dependency (same robot) | 41 | −0.20 [−0.39, −0.05] | 0.00 |
@@ -149,6 +210,9 @@ Suggested sentence: *"The improvement over reactive recovery is unchanged under 
 The preventive gain is about twice as large when the consequences cross robots.
 
 ### 1.6 Decision latency (per decision, no noise, µs)
+
+Rows: deviation types. Columns: the per-decision time percentiles of DWAFP, then of mission-wide
+search (wall clock on the development PC, microseconds; 1000 µs = 1 ms).
 
 | Deviation | DWAFP p50 / p95 / p99 | Mission-wide p50 / p95 / p99 |
 |---|---|---|
@@ -192,6 +256,10 @@ homogeneous rates or fleet sizes that preserve the speed mix.
 ---
 
 ## 3. Claims
+
+One row per claim the paper may make. Evidence: the sections supporting it. Status: **supported**
+(the evidence is clear), **promising** (consistent so far, but limited), **not yet supported**
+(current results do not show it), **pending** (the experiment is still to run).
 
 | Claim | Evidence | Status |
 |---|---|---|

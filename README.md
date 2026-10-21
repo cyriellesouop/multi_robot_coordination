@@ -392,6 +392,9 @@ ros2 run actions dwafp_experiments 200 results/main_noise10.csv 0.1   # robustne
 
 ## Changelog
 
+### 2026-10-21 - Explain how to read the results tables
+- `results/results_paper.md` now defines every row (deviation types, with or without warning in the feedback) and every column or term (paired difference with its confidence interval, wins/ties/losses, success, miss rate, tardiness, makespan, harmful, unneeded, realized, latency percentiles), with a note above each table. No code change.
+
 ### 2026-10-21 - Add the experiment runner and the closed-loop comparison
 - `run_method()` measures what really happened in one run, and `compare()` gives paired statistics with bootstrap confidence intervals; `dwafp_experiments` compares the five methods per deviation type, with harmful and unneeded interventions, decision latency percentiles and a breakdown by source class. The simulator now reports whether each injected deviation was realized.
 - Results and the paper notes are in `results/` (`results_paper.md`); reproduce them with `ros2 run actions dwafp_experiments 200 results/main_noise0.csv 0` (and `0.1` for 10 % noise).
