@@ -25,6 +25,7 @@ add_library(dwafp_core STATIC
   src/simulator.cpp  # C6: closed-loop simulator (the world)
   src/controllers.cpp  # C6: the compared methods as simulator controllers
   src/scenarios.cpp  # C6: scenario generator
+  src/runner.cpp  # C6: experiment runner (one run, paired statistics)
 )
 target_include_directories(dwafp_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -42,10 +43,15 @@ ament_target_dependencies(coordinator_action_client rclcpp rclcpp_action multi_r
 add_executable(stage1_experiments src/stage1_experiments.cpp)
 target_link_libraries(stage1_experiments dwafp_core)
 
+# Closed-loop experiments (simulator + the five methods), ROS-free.
+add_executable(dwafp_experiments src/dwafp_experiments.cpp)
+target_link_libraries(dwafp_experiments dwafp_core)
+
 install(TARGETS 
 robot_action_server 
 coordinator_action_client
 stage1_experiments
+dwafp_experiments
 DESTINATION lib/${PROJECT_NAME}/
 ) # After building, copy the executable robot_action_server into the install directory so ROS 2 can find and run it
 
@@ -87,6 +93,10 @@ if(BUILD_TESTING)
   # C6: scenario generator.
   ament_add_gtest(test_scenarios test/test_scenarios.cpp)
   target_link_libraries(test_scenarios dwafp_core)
+
+  # C6: experiment runner.
+  ament_add_gtest(test_runner test/test_runner.cpp)
+  target_link_libraries(test_runner dwafp_core)
 
   # C3: Stage I repair candidates, same config files.
   ament_add_gtest(test_repair test/test_repair.cpp)

@@ -82,6 +82,7 @@ struct ControllerStats
   int errors{0};               // decisions abandoned because a state or edit was invalid (should be 0)
   double decision_us{0};       // total wall-clock time spent deciding
   double max_decision_us{0};
+  std::vector<double> decision_times_us;  // every single decision (for latency percentiles)
 };
 
 class MethodController : public SimulationObserver

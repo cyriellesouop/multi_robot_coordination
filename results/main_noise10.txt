@@ -1,0 +1,117 @@
+DWAFP closed-loop comparison, robustness configuration: 200 paired runs per deviation type
+4 robots, 20 tasks, all four shapes, deadlines on every task, slack 0.5-3 x duration, noise 10%,
+2x execution timeout, latency 0 ms, nominal estimate, trigger k=3 eps=0 ms tau=2000 ms
+(persistent obstruction: the robot reports that same-robot retry is not feasible; the
+ preventive methods use this diagnostic before the execution timeout)
+
+=== transient delay ===
+  method           success missRate complete  misses  never tardy(s)*  makespan** realized
+  no intervention      68%     4.4%    98.8%    0.87   0.24      0.90   59.5 (194)     100%
+  reactive             68%     3.1%   100.0%    0.62   0.00      0.95   59.7 (200)     100%
+  source-only          81%     1.5%   100.0%    0.30   0.00      0.43   59.1 (200)     100%
+  DWAFP                82%     1.4%   100.0%    0.28   0.00      0.33   59.0 (200)     100%
+  mission-wide         82%     1.4%   100.0%    0.28   0.00      0.33   59.0 (200)     100%
+  * tardiness of COMPLETED tasks only (read with 'never')   ** mean over the runs in which every task completed (count)
+  method            edits prevent recover finalMv  harmful unneeded   decisions  p50(us)  p95(us)  p99(us)
+  reactive           0.09    0.00    0.09    0.09        0        0         131       61       83      100
+  source-only        0.26    0.21    0.04    0.24        0        6        6521       15       26      122
+  DWAFP              0.31    0.27    0.04    0.29        0        7        6580       15       25      184
+  mission-wide       0.31    0.27    0.04    0.29        0        7        6580       15       25      319
+  deviation realized under every method in 200 / 200 scenarios
+  DWAFP vs           misses: mean diff [95% CI]   W / T / L      never: mean diff [95% CI]
+    no intervention   -0.59 [ -0.87,  -0.37]   40 / 160 /   0    -0.24 [ -0.54,  -0.04]
+    reactive          -0.34 [ -0.47,  -0.24]   37 / 163 /   0    +0.00 [ +0.00,  +0.00]
+    source-only       -0.03 [ -0.07,  +0.01]    4 / 195 /   1    +0.00 [ +0.00,  +0.00]
+    mission-wide      +0.00 [ +0.00,  +0.00]    0 / 200 /   0    +0.00 [ +0.00,  +0.00]
+  by source class          n   DWAFP-reactive misses [95% CI]   DWAFP-source-only misses [95% CI]
+  downstream dependency    41    -0.17 [ -0.32,  -0.05]           -0.02 [ -0.07,  +0.00]
+  cross-robot handoff     159    -0.39 [ -0.53,  -0.26]           -0.03 [ -0.08,  +0.01]
+
+=== persistent obstruction ===
+  method           success missRate complete  misses  never tardy(s)*  makespan** realized
+  no intervention       0%    45.3%    55.5%    9.05   8.90      0.36    0.0 (  0)     100%
+  reactive              8%    18.3%   100.0%    3.65   0.00     14.24   62.8 (200)     100%
+  source-only          62%     7.8%   100.0%    1.57   0.00      7.35   59.9 (200)     100%
+  DWAFP                63%     7.7%   100.0%    1.55   0.00      6.87   59.8 (200)     100%
+  mission-wide         63%     7.7%   100.0%    1.55   0.00      6.87   59.8 (200)     100%
+  * tardiness of COMPLETED tasks only (read with 'never')   ** mean over the runs in which every task completed (count)
+  method            edits prevent recover finalMv  harmful unneeded   decisions  p50(us)  p95(us)  p99(us)
+  reactive           1.84    0.00    1.84    1.77        1        0         891       55       78       90
+  source-only        1.42    0.72    0.70    1.35        1        0        5718       16       63      129
+  DWAFP              1.43    0.75    0.68    1.38        1        0        5726       15       65      681
+  mission-wide       1.43    0.75    0.68    1.38        1        0        5726       15       65      842
+  deviation realized under every method in 200 / 200 scenarios
+  DWAFP vs           misses: mean diff [95% CI]   W / T / L      never: mean diff [95% CI]
+    no intervention   -7.50 [ -8.21,  -6.83]  192 /   7 /   1    -8.90 [ -9.57,  -8.23]
+    reactive          -2.10 [ -2.50,  -1.74]  118 /  81 /   1    +0.00 [ +0.00,  +0.00]
+    source-only       -0.02 [ -0.07,  +0.01]    2 / 197 /   1    +0.00 [ +0.00,  +0.00]
+    mission-wide      +0.00 [ +0.00,  +0.00]    0 / 200 /   0    +0.00 [ +0.00,  +0.00]
+  by source class          n   DWAFP-reactive misses [95% CI]   DWAFP-source-only misses [95% CI]
+  downstream dependency    41    -1.27 [ -1.78,  -0.80]           -0.10 [ -0.29,  +0.00]
+  cross-robot handoff     159    -2.32 [ -2.76,  -1.87]           +0.00 [ -0.02,  +0.02]
+
+=== outcome failure ===
+  method           success missRate complete  misses  never tardy(s)*  makespan** realized
+  no intervention       0%    44.5%    55.5%    8.90   8.90      0.00    0.0 (  0)     100%
+  reactive             85%     1.1%   100.0%    0.23   0.00      0.15   58.9 (200)     100%
+  source-only          88%     0.9%   100.0%    0.17   0.00      0.13   58.8 (200)     100%
+  DWAFP                90%     0.8%   100.0%    0.17   0.00      0.13   58.8 (200)     100%
+  mission-wide         90%     0.8%   100.0%    0.17   0.00      0.13   58.8 (200)     100%
+  * tardiness of COMPLETED tasks only (read with 'never')   ** mean over the runs in which every task completed (count)
+  method            edits prevent recover finalMv  harmful unneeded   decisions  p50(us)  p95(us)  p99(us)
+  reactive           1.00    0.00    1.00    0.17        0        0         245       72       93      102
+  source-only        1.05    0.06    1.00    0.23        0        0        5091       15       53       84
+  DWAFP              1.07    0.07    1.00    0.24        0        0        5163       15       39       83
+  mission-wide       1.07    0.07    1.00    0.24        0        0        5163       15       40       83
+  deviation realized under every method in 200 / 200 scenarios
+  DWAFP vs           misses: mean diff [95% CI]   W / T / L      never: mean diff [95% CI]
+    no intervention   -8.73 [ -9.38,  -8.06]  200 /   0 /   0    -8.90 [ -9.57,  -8.23]
+    reactive          -0.06 [ -0.10,  -0.03]   10 / 190 /   0    +0.00 [ +0.00,  +0.00]
+    source-only       -0.01 [ -0.03,  +0.01]    3 / 196 /   1    +0.00 [ +0.00,  +0.00]
+    mission-wide      +0.00 [ +0.00,  +0.00]    0 / 200 /   0    +0.00 [ +0.00,  +0.00]
+  by source class          n   DWAFP-reactive misses [95% CI]   DWAFP-source-only misses [95% CI]
+  downstream dependency    41    -0.02 [ -0.07,  +0.00]           -0.02 [ -0.07,  +0.00]
+  cross-robot handoff     159    -0.07 [ -0.12,  -0.03]           -0.01 [ -0.03,  +0.01]
+
+=== robot breakdown ===
+  method           success missRate complete  misses  never tardy(s)*  makespan** realized
+  no intervention       0%    37.8%    62.2%    7.57   7.57      0.00   56.7 (  1)     100%
+  reactive             70%     5.5%   100.0%    1.10   0.00      3.93   57.3 (200)     100%
+  source-only          70%     5.4%   100.0%    1.08   0.00      3.92   57.3 (200)     100%
+  DWAFP                71%     5.2%   100.0%    1.05   0.00      3.77   57.2 (200)     100%
+  mission-wide         71%     5.2%   100.0%    1.05   0.00      3.77   57.2 (200)     100%
+  * tardiness of COMPLETED tasks only (read with 'never')   ** mean over the runs in which every task completed (count)
+  method            edits prevent recover finalMv  harmful unneeded   decisions  p50(us)  p95(us)  p99(us)
+  reactive           4.34    0.00    4.34    4.30        4        0        1049       56       97      123
+  source-only        4.38    0.04    4.35    4.33        3        0        6081       16       67       95
+  DWAFP              4.40    0.05    4.35    4.33        3        0        6075       16       67       96
+  mission-wide       4.40    0.05    4.35    4.33        3        0        6075       16       67       97
+  deviation realized under every method in 200 / 200 scenarios
+  DWAFP vs           misses: mean diff [95% CI]   W / T / L      never: mean diff [95% CI]
+    no intervention   -6.52 [ -7.20,  -5.91]  189 /   8 /   3    -7.57 [ -8.23,  -6.93]
+    reactive          -0.06 [ -0.12,  -0.01]    6 / 193 /   1    +0.00 [ +0.00,  +0.00]
+    source-only       -0.04 [ -0.09,  +0.00]    3 / 197 /   0    +0.00 [ +0.00,  +0.00]
+    mission-wide      +0.00 [ +0.00,  +0.00]    0 / 200 /   0    +0.00 [ +0.00,  +0.00]
+
+=== mix 35/25/25/15 ===
+  method           success missRate complete  misses  never tardy(s)*  makespan** realized
+  no intervention      22%    31.4%    70.1%    6.28   5.98      0.49   58.2 ( 64)     100%
+  reactive             53%     7.3%   100.0%    1.45   0.00      4.33   60.3 (200)     100%
+  source-only          76%     3.5%   100.0%    0.70   0.00      2.08   59.0 (200)     100%
+  DWAFP                77%     3.4%   100.0%    0.68   0.00      2.03   59.0 (200)     100%
+  mission-wide         77%     3.4%   100.0%    0.68   0.00      2.03   59.0 (200)     100%
+  * tardiness of COMPLETED tasks only (read with 'never')   ** mean over the runs in which every task completed (count)
+  method            edits prevent recover finalMv  harmful unneeded   decisions  p50(us)  p95(us)  p99(us)
+  reactive           1.24    0.00    1.24    0.98        0        0         475       58       92      134
+  source-only        1.18    0.30    0.88    0.93        0        0        5812       15       55       95
+  DWAFP              1.23    0.35    0.88    0.97        0        0        5877       15       52      246
+  mission-wide       1.23    0.35    0.88    0.97        0        0        5877       15       52      479
+  deviation realized under every method in 200 / 200 scenarios
+  DWAFP vs           misses: mean diff [95% CI]   W / T / L      never: mean diff [95% CI]
+    no intervention   -5.59 [ -6.42,  -4.85]  143 /  57 /   0    -5.98 [ -6.85,  -5.20]
+    reactive          -0.77 [ -1.00,  -0.56]   55 / 144 /   1    +0.00 [ +0.00,  +0.00]
+    source-only       -0.02 [ -0.06,  +0.01]    4 / 194 /   2    +0.00 [ +0.00,  +0.00]
+    mission-wide      +0.00 [ +0.00,  +0.00]    0 / 200 /   0    +0.00 [ +0.00,  +0.00]
+
+controller errors (must be 0): 0
+CSV written to src/results/main_noise10.csv

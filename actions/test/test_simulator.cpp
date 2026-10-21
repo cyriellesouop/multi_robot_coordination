@@ -677,3 +677,42 @@ TEST(Simulator, CompletionExactlyAtTheTimeoutSucceeds)
   EXPECT_EQ(rec[t1].timeouts, 0);
 }
 
+// Realized deviations: an obstruction counts as realized when an attempt reaches it; a method that
+// moves the source BEFORE that point avoids it. A failure is realized when the failure point is
+// reached, a breakdown when its time is reached.
+TEST(Simulator, DeviationsAreReportedAsRealizedOnlyWhenTheyHappen)
+{
+  const Mission m = load("chain.yaml");
+  const Index t1 = m.task_index("T1");
+  const Index t2 = m.task_index("T2");
+  {  // blocked at 2 s: realized
+    Simulator sim(m, Plan::initial(m), blocked_chain(m, 3000, false));
+    sim.run();
+    EXPECT_EQ(sim.deviations_realized(), (std::vector<bool>{true}));
+  }
+  {  // T1 moved to robot3 at 1 s, before reaching the obstruction (2 s): avoided
+    Simulator sim(m, Plan::initial(m), blocked_chain(m, 3000, false));
+    Scripted move(1000, [&](Simulator & s) {s.apply_edit(Plan::from_queues(m, {{}, {t2}, {t1}}), {t1}, s.now());});
+    sim.run(&move);
+    EXPECT_EQ(sim.deviations_realized(), (std::vector<bool>{false}));
+  }
+  {  // outcome failure at 60 % (3 s): realized
+    WorldConfig config;
+    config.deviations.push_back({DeviationType::kOutcomeFailure, t1, dwafp::kNoIndex, 0.6, 0, 0, false});
+    Simulator sim(m, Plan::initial(m), config);
+    sim.run();
+    EXPECT_EQ(sim.deviations_realized(), (std::vector<bool>{true}));
+  }
+  {  // breakdown of robot3 (no work) at 1 s: realized (it happened, even without consequence)
+    WorldConfig config;
+    InjectedDeviation b;
+    b.type = DeviationType::kRobotBreakdown;
+    b.robot = m.robot_index("robot3");
+    b.at_time_ms = 1000;
+    config.deviations.push_back(b);
+    Simulator sim(m, Plan::initial(m), config);
+    sim.run();
+    EXPECT_EQ(sim.deviations_realized(), (std::vector<bool>{true}));
+  }
+}
+

@@ -162,6 +162,10 @@ src/
 ├── README.md
 ├── TESTING.md
 ├── .gitignore
+├── results/
+│   ├── results_paper.md
+│   ├── main_noise0.csv, main_noise0.txt
+│   └── main_noise10.csv, main_noise10.txt
 ├── .vscode/
 │   └── c_cpp_properties.json
 ├── .claude/
@@ -187,6 +191,7 @@ src/
     │   ├── simulator.hpp
     │   ├── controllers.hpp
     │   ├── scenarios.hpp
+    │   ├── runner.hpp
     │   └── mission_loader.hpp
     ├── launch/
     │   └── mock_fleet.launch.py
@@ -199,6 +204,8 @@ src/
     │   ├── simulator.cpp
     │   ├── controllers.cpp
     │   ├── scenarios.cpp
+    │   ├── runner.cpp
+    │   ├── dwafp_experiments.cpp
     │   ├── stage1_experiments.cpp
     │   └── mission_loader.cpp
     └── test/
@@ -207,7 +214,8 @@ src/
         ├── test_repair.cpp
         ├── test_simulator.cpp
         ├── test_controllers.cpp
-        └── test_scenarios.cpp
+        ├── test_scenarios.cpp
+        └── test_runner.cpp
 ```
 
 ### Root files
@@ -216,6 +224,7 @@ src/
 |---|---|
 | `README.md` | This file: project overview, layout, build and run instructions. |
 | `TESTING.md` | Manual tests with the commands to type and the expected results: the mock robot alone (accept, reject, cancel, retry), the coordinator client (deviations, cancel, robot not available), the robot parameters (speed, time scale, name, namespace) and the fleet launch file. |
+| `results/` | Results for the paper: `results_paper.md` (every result that may go into the paper, its configuration, the data file and the command that reproduces it, and which claims it supports), and the data of the closed-loop comparison without noise (`main_noise0.csv`) and with 10 % duration noise (`main_noise10.csv`), one line per scenario and method, with the full terminal outputs (`.txt`). |
 | `.gitignore` | Keeps colcon output (`build/`, `install/`, `log/`) and Python caches out of the repository. |
 | `.vscode/c_cpp_properties.json` | VS Code IntelliSense configuration with the ROS 2 Humble include paths, so the editor can resolve `rclcpp` and the generated interface headers. |
 | `.claude/settings.json` | Claude Code project settings: no AI attribution in commits, and a confirmation prompt before every `git commit` and `git push`. |
@@ -256,6 +265,8 @@ Run `ros2 interface show multi_robot_interfaces/action/ExecuteSubtask` to see th
 | `include/actions/simulator.hpp`, `src/simulator.cpp` | **Closed-loop simulator (the world and the controller interface).** A discrete-event simulation that executes a mission over time so that methods can be compared on what really happens. The ground truth is known only to the simulator: real durations (nominal times a noise factor drawn from a hash of seed, task, robot and attempt, so every method sees the same noise), and the injected deviations: a transient blockage (one absolute interval with a fixed clearing time), a persistent one (the robot-task pair never progresses past the blocking point), an outcome failure, or a robot breakdown. A controller sees only what a coordinator would: feedback (the robot's remaining-time estimate, which stays constant while it is blocked, and BLOCKED), task results, breakdowns, and each deadline miss (reported once), through a `SimulationObserver`. One dispatcher serves every method (a task starts when it is next in its robot's fixed queue, its robot is available and idle, its inputs completed, it is not held and its release time has passed). Simultaneous events follow a fixed order (completions, breakdowns, deadline misses, feedback, dispatch). The record gives each task's final status (completed, failed, never started, incomplete), attempts, times, discarded work and wasted elapsed time, and whether its deadline was met. A controller (a `SimulationObserver`) gets one turn per time step in `act()`, where it can hold tasks, ask for a wake-up, install a repair at once (`apply_edit`) or schedule it with a dispatch latency (`schedule_edit`): until the activation time the running task keeps progressing and the old queues stay active, and at activation a running edited task is cancelled (its progress is counted as discarded) and restarted or moved, or the edit is rejected if an edited task completed in the meantime (or no longer fits the state); an invalid edit changes nothing. `edit_counts()` reports how many edits were scheduled, installed, and rejected because a task had completed or because the edit was invalid. The same-robot retry diagnostic belongs to the task-robot pair, so a task moved to another robot takes that pair's diagnostic. A task cancelled by a repair and not run again ends as unstarted at the end. Every attempt can have an execution timeout (a multiplier of its nominal duration, independent of the mission deadline): an attempt that would end later fails at the timeout like any failure, one that completes exactly at it succeeds. The controllers themselves (the compared methods) come next. |
 | `include/actions/controllers.hpp`, `src/controllers.cpp` | **The compared methods as simulator controllers.** One `MethodController` with the method as a setting: no intervention, reactive, source-only, DWAFP and mission-wide. All see only what a coordinator sees and share the policy library, the validation, the dispatch latency and the remaining-time estimator. Actual failures, robot breakdowns and deadline misses of unfinished tasks go to the same recovery for every repair-enabled method (one edit of the affected task that lowers first the number of tasks that would never complete, then the total tardiness; a breakdown hands every unfinished task of the robot to it). Trigger events from robot feedback go to prevention for source-only (edits restricted to the deviating task), DWAFP (the repair region) and mission-wide (any unfinished task): `decide()` runs the impact analysis, the infeasibility certificate and Stage I, and only a preventive repair is executed; otherwise the event is escalated and the trigger is re-armed. So the difference between DWAFP and reactive measures the value of acting before a failure. While a robot is blocked, the remaining time is its own estimate (nominal, primary) or that estimate plus the time blocked so far (conservative, sensitivity); a persistent obstruction reported by the robot makes the task unreachable on it in both. The controller counts trigger events, analyses, repairs, escalations by reason, recovery edits and decision time. |
 | `include/actions/scenarios.hpp`, `src/scenarios.cpp` | **Scenario generator** for the closed-loop experiments. `make_scenario(config, seed)` returns a mission, its initial plan and its world (duration noise, a 2x execution timeout and one injected deviation), reproducibly. Workflow shapes: random DAG, chains, fork-join and rendezvous, with robot locality (a robot mostly continues its own line of work). Deadlines are duration-normalized additive slack on the nominal finish (so the nominal plan always meets them), on every task or only on handoff and final tasks. The deviation is a transient delay (relative to the source's duration), a persistent obstruction, an outcome failure or a robot breakdown, drawn from a configurable mix; the source is a task starting in the first 60 % of the makespan and, by default, one with a dependency successor (a graph without one is regenerated deterministically, never replaced by another rule, and the generator throws if none can be found). The source class (source only, same-robot queue, downstream dependency, cross-robot handoff over all descendants) is recorded. Robots can be homogeneous for scaling experiments. |
+| `include/actions/runner.hpp`, `src/runner.cpp` | **Experiment runner.** `run_method(scenario, config)` executes one scenario under one method and measures what really happened: deadline misses (and the miss rate over tasks with a deadline), tasks completed and never completed, success, tardiness of completed tasks, makespan, timeouts, final assignment changes, edits scheduled, installed and rejected, discarded work, wasted time, whether the injected deviation was realized, and the controller's statistics with every decision time. `compare()` gives paired wins, ties and losses, the mean difference and a bootstrap 95 % confidence interval. |
+| `src/dwafp_experiments.cpp` | **Closed-loop comparison** (`dwafp_experiments`, ROS-free): every scenario is executed under no intervention, reactive, source-only, DWAFP and mission-wide, per deviation type (transient delay, persistent obstruction, outcome failure, robot breakdown) and for a mix. It prints the outcomes, the interventions (harmful and unneeded ones, decision latency percentiles), DWAFP against each method with confidence intervals, and a breakdown by source class. The configuration is set explicitly and recorded in the CSV; a noise level can be given (0 = controlled configuration). |
 | `src/stage1_experiments.cpp` | **ROS-free Stage I experiments** (`stage1_experiments`, uses only `dwafp_core`, no ROS node): a walkthrough of named scenarios; an ablation on the same random missions and events (no repair, source-only, DWAFP region, global single-edit) with normal, tight and very tight deadline slack; scaling with fixed mission size and varying robots, with fixed tasks per robot, and with fixed robots and varying mission size (repair-region size and its share of the remaining tasks, timings); and same-robot retry feasibility against dispatch latency. Every chosen repair is re-checked with a full propagation. |
 | `include/actions/mission_loader.hpp`, `src/mission_loader.cpp` | Loads a `Mission` from a mission YAML file and the fleet file `config/mock_fleet.yaml` (robot speed from `step_duration_sec`), with an error message naming the file and the subtask for every mistake. |
 | `config/missions/chain.yaml`, `config/missions/fork_join.yaml` | The two reference missions: a chain (T1 then T2) and a fork-join (T1 and T2 in parallel, then T3). Deadlines are nominal seconds from mission start. |
@@ -264,10 +275,11 @@ Run `ros2 interface show multi_robot_interfaces/action/ExecuteSubtask` to see th
 | `launch/mock_fleet.launch.py` | Starts one `robot_action_server` per robot of the fleet file, each in its own namespace (`/<name>`), with the same `time_scale`. Launch arguments: `time_scale` (default 1.0) and `fleet_config` (YAML file, default `config/mock_fleet.yaml`). It stops with an error if the file has no robots, a robot without a name, or a name used twice. |
 | `config/mock_fleet.yaml` | The mock fleet: one entry per robot with its `name` (namespace) and optionally `step_duration_sec` (speed), `simulated_delay_sec` and `delay_at_step`. Three robots with different speeds by default. All durations are nominal seconds. The workflow library reads the same file for the robots' speeds. |
 | `test/test_repair.cpp` | 19 unit tests of Stage I and `decide()`: the candidates and their scores computed by hand for a blocked source, response-window effects (dispatch latency absorbed by dependency waiting or making an upstream repair too late), takeover, rejection of a candidate that breaks another task, retry on transient and persistent causes, outcome failures with loose and tight slack, a case where no robot is idle, an incumbent window of 0 that does not reject a faster robot, the repair scopes, the infeasibility certificate (including a randomized check against the global single-edit oracle) the decision statuses, and a moved running task keeping its old robot busy until activation. |
-| `test/test_simulator.cpp` | 26 unit tests of the simulator and its controller interface: without noise or deviations the executed times equal the prediction exactly (demo missions and 50 random missions), reproducible and bounded noise, a transient blockage, a persistent one that stays incomplete at the horizon, an outcome failure, a robot breakdown, a held task, the fixed queue, one deadline-miss report per task (also for an unstarted task), the order of a completion and a breakdown at the same time, discarded work against wasted time, and, through scripted controllers, retries before and after a transient obstruction clears (the original clearing time is kept), retries on a persistent one, substitution, unchanged noise for unaffected tasks, invalid edits without side effects, hold and release, edits with dispatch latency (the running task keeps progressing, old queues stay active, an edit is rejected if its task completes before activation) the retry diagnostic of the task-robot pair, and the execution timeout (including a completion exactly at the timeout). |
+| `test/test_simulator.cpp` | 27 unit tests of the simulator and its controller interface: without noise or deviations the executed times equal the prediction exactly (demo missions and 50 random missions), reproducible and bounded noise, a transient blockage, a persistent one that stays incomplete at the horizon, an outcome failure, a robot breakdown, a held task, the fixed queue, one deadline-miss report per task (also for an unstarted task), the order of a completion and a breakdown at the same time, discarded work against wasted time, and, through scripted controllers, retries before and after a transient obstruction clears (the original clearing time is kept), retries on a persistent one, substitution, unchanged noise for unaffected tasks, invalid edits without side effects, hold and release, edits with dispatch latency (the running task keeps progressing, old queues stay active, an edit is rejected if its task completes before activation) the retry diagnostic of the task-robot pair, the execution timeout (including a completion exactly at the timeout), and whether each injected deviation was realized. |
 | `test/test_controllers.cpp` | 8 unit tests of the methods on the same simulated world: with a persistent obstruction, DWAFP moves the blocked task early and meets both deadlines while the reactive method recovers only at the execution timeout and misses the second deadline, and no intervention never completes; a timeout handled identically by every repair-enabled method; the dispatch latency; source-only and mission-wide agreeing when the source must move; an outcome failure and a robot breakdown handled identically by reactive and DWAFP through the common recovery; an absorbed deviation causing no repair; and the persistent diagnosis used by both estimators. |
 | `test/test_scenarios.cpp` | 11 unit tests of the generator: every shape, deadline structure and size is feasible when nothing deviates, full reproducibility, handoff-and-final deadlines, the structure of each shape, the deviation mix and window (source start, breakdown robot with work left), tasks without a deadline never producing deadline events, a guaranteed eligible source or a clear refusal, source classes over all descendants, and homogeneous rates. |
-| `CMakeLists.txt` | Builds the `dwafp_core` library and the `robot_action_server`, `coordinator_action_client` and `stage1_experiments` executables, installs the executables and the `launch/` and `config/` folders, and registers the `test_workflow`, `test_impact`, `test_repair`, `test_simulator`, `test_controllers` and `test_scenarios` unit tests. |
+| `test/test_runner.cpp` | 3 unit tests of the runner: the metrics of a hand-computed scenario under no intervention, reactive and DWAFP, reproducible paired runs, and the paired statistics (wins, ties, losses, mean difference, confidence interval). |
+| `CMakeLists.txt` | Builds the `dwafp_core` library and the `robot_action_server`, `coordinator_action_client` and `stage1_experiments` and `dwafp_experiments` executables, installs the executables and the `launch/` and `config/` folders, and registers the `test_workflow`, `test_impact`, `test_repair`, `test_simulator`, `test_controllers`, `test_scenarios` and `test_runner` unit tests. |
 | `package.xml` | Package manifest: depends on `rclcpp`, `rclcpp_action`, `multi_robot_interfaces`, `geometry_msgs`, `diagnostic_msgs` and `yaml-cpp`; the launch file also needs `launch`, `launch_ros` and `python3-yaml`; the unit tests need `ament_cmake_gtest`. |
 
 ## Build
@@ -353,6 +365,13 @@ To run the ROS-free Stage I experiments (walkthrough, ablation, scaling; about 7
 ros2 run actions stage1_experiments 300 1 results.csv
 ```
 
+To run the closed-loop comparison of the five methods (a few seconds each; arguments: scenarios per deviation type, CSV file, duration noise), as recorded in `results/`:
+
+```bash
+ros2 run actions dwafp_experiments 200 results/main_noise0.csv 0      # controlled, no noise
+ros2 run actions dwafp_experiments 200 results/main_noise10.csv 0.1   # robustness, 10 % noise
+```
+
 ## Status
 
 - [x] `ExecuteSubtask` action interface
@@ -365,12 +384,17 @@ ros2 run actions stage1_experiments 300 1 results.csv
 - [x] Closed-loop simulator: the world (ground truth, dispatcher, feedback, deviations, outcome record) and the controller interface (hold, wake-up, edits with dispatch latency)
 - [x] The compared methods as simulator controllers (no intervention, reactive, source-only, DWAFP, mission-wide)
 - [x] Scenario generator (workflow shapes, deadline structures, deviation mix, source classes, execution timeout)
-- [ ] The experiment runner and the outcome comparison
+- [x] Experiment runner and closed-loop comparison of the five methods per deviation type (results in `results/`)
+- [ ] Remaining experiments (deadline structure, noise sweep, latency, estimator, timeout, scaling, failure taxonomy)
 - [ ] Two-edit repair, the full escalation procedure and the remaining baselines (the hold rule, the infeasibility certificate and the `decide()` statuses up to Stage I are done)
 - [ ] Unit and integration tests (first step done: unit tests of the workflow library; none yet for the nodes)
 - [ ] Nova Carter robot server (Nav2)
 
 ## Changelog
+
+### 2026-10-21 - Add the experiment runner and the closed-loop comparison
+- `run_method()` measures what really happened in one run, and `compare()` gives paired statistics with bootstrap confidence intervals; `dwafp_experiments` compares the five methods per deviation type, with harmful and unneeded interventions, decision latency percentiles and a breakdown by source class. The simulator now reports whether each injected deviation was realized.
+- Results and the paper notes are in `results/` (`results_paper.md`); reproduce them with `ros2 run actions dwafp_experiments 200 results/main_noise0.csv 0` (and `0.1` for 10 % noise).
 
 ### 2026-10-20 - Add the scenario generator and the execution timeout
 - `make_scenario(config, seed)` builds reproducible missions (random DAG, chains, fork-join, rendezvous) with duration-normalized deadline slack, on every task or on handoff and final tasks only, and one injected deviation with a recorded source class. Every attempt now has an execution timeout independent of the mission deadline, so the reactive method acts at the timeout, like a robot reporting a failure.

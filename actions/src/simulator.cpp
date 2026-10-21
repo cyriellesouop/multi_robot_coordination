@@ -73,6 +73,7 @@ Simulator::Simulator(const Mission & mission, Plan plan, WorldConfig config)
   clear_ms_.assign(config_.deviations.size(), kUnreachable);
   deadline_reported_.assign(n, false);
   persistent_pair_.assign(n * mission_.robot_count(), false);
+  realized_.assign(config_.deviations.size(), false);
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -107,11 +108,13 @@ void Simulator::start_attempt(Index j, TimeMs t)
   // for a failure, only if the cause is persistent.
   const bool same_pair = rec.attempts == 1 || r == first_attempt_robot_[j];
   TimeMs work_end = a.true_duration_ms;  // working time after which the attempt ends
-  for (const InjectedDeviation & d : config_.deviations) {
+  for (std::size_t i = 0; i < config_.deviations.size(); ++i) {
+    const InjectedDeviation & d = config_.deviations[i];
     if (d.type == DeviationType::kOutcomeFailure && d.task == j && (rec.attempts == 1 ||
       (d.persistent && same_pair)))
     {
       a.fails = true;
+      a.failure_deviation = static_cast<int>(i);
       work_end = std::min<TimeMs>(work_end, std::llround(d.at_fraction * static_cast<double>(a.true_duration_ms)));
     }
   }
@@ -132,6 +135,7 @@ void Simulator::start_attempt(Index j, TimeMs t)
     a.blocks = true;
     a.block_start_ms = reach;
     a.block_end_ms = clear;
+    a.block_deviation = static_cast<int>(i);
     break;  // one obstruction per attempt
   }
   // End: after the blockage (if any), the rest of the work.
@@ -140,6 +144,7 @@ void Simulator::start_attempt(Index j, TimeMs t)
   } else {
     a.end_ms = t + work_end;
   }
+  a.failure_ms = a.end_ms;  // the outcome failure, if any, ends the attempt (unless timed out first)
   // Execution timeout: the robot gives up after q = multiplier x nominal duration and reports a
   // failure (no output) at that time, whatever would have happened later.
   if (config_.timeout_multiplier > 0.0) {
@@ -160,6 +165,14 @@ void Simulator::start_attempt(Index j, TimeMs t)
   task.end_ms = 0;
   rec.robot = r;
   rec.start_ms = t;
+}
+
+void Simulator::mark_realized(const Attempt & a, TimeMs t)
+{
+  if (a.block_deviation >= 0 && t >= a.block_start_ms) {realized_[static_cast<std::size_t>(a.block_deviation)] = true;}
+  if (a.failure_deviation >= 0 && !a.times_out && t >= a.failure_ms) {
+    realized_[static_cast<std::size_t>(a.failure_deviation)] = true;
+  }
 }
 
 TimeMs Simulator::worked_ms(const Attempt & a, TimeMs t) const
@@ -296,6 +309,11 @@ bool Simulator::step(SimulationObserver * observer)
   wakeups_.erase(std::remove_if(wakeups_.begin(), wakeups_.end(), [t](TimeMs w) {return w <= t;}),
     wakeups_.end());
 
+  // 0. Record the injected deviations that the running attempts have reached by now.
+  for (const Attempt & a : attempts_) {
+    if (a.active) {mark_realized(a, t);}
+  }
+
   // 1. Attempts that end now (completions before breakdowns: a robot that finishes exactly when
   //    it breaks down has finished).
   for (Index j = 0; j < attempts_.size(); ++j) {
@@ -308,6 +326,7 @@ bool Simulator::step(SimulationObserver * observer)
     const InjectedDeviation & d = config_.deviations[i];
     if (d.type != DeviationType::kRobotBreakdown || breakdown_done_[i] || d.at_time_ms > t) {continue;}
     breakdown_done_[i] = true;
+    realized_[i] = true;
     state_.robots[d.robot].available = false;
     state_.robots[d.robot].unavailable_since_ms = t;
     if (observer) {observer->on_robot_unavailable(d.robot, t);}
@@ -475,6 +494,7 @@ void Simulator::install_or_throw(const Plan & new_plan, const std::vector<Index>
   for (const Index j : edited) {
     Attempt & a = attempts_[j];
     if (!a.active) {continue;}
+    mark_realized(a, now);  // a deviation reached before the cancellation did happen
     a.active = false;
     records_[j].discarded_work_ms += worked_ms(a, now);
     records_[j].wasted_elapsed_ms += now - a.start_ms;

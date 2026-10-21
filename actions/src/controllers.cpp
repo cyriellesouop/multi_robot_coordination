@@ -89,6 +89,7 @@ void MethodController::timed(double us)
 {
   stats_.decision_us += us;
   stats_.max_decision_us = std::max(stats_.max_decision_us, us);
+  stats_.decision_times_us.push_back(us);
 }
 
 // ----------------------------------------------------------------------------------------------

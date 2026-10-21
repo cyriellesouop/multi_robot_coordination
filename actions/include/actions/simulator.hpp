@@ -190,6 +190,12 @@ public:
 
   const Mission & mission() const {return mission_;}
   const EditCounts & edit_counts() const {return edit_counts_;}
+  // Per injected deviation (same order as WorldConfig::deviations): did it actually happen?
+  //   delay     : an attempt of the source REACHED the obstruction (it was blocked)
+  //   failure   : an attempt of the source reached the failure point and failed there
+  //   breakdown : the breakdown time was reached
+  // A method that moves or cancels the source before that point avoids it (not realized).
+  const std::vector<bool> & deviations_realized() const {return realized_;}
 
   // --- What a controller may change (only from SimulationObserver::act) -----------------------
   // Tasks the dispatcher must not start (hold guard); replaces the previous set.
@@ -234,7 +240,12 @@ private:
     bool fails{false};               // this attempt ends with an outcome failure (or a timeout)
     bool times_out{false};           // ... because the execution timeout was reached
     TimeMs end_ms{0};                // completion or failure time (absolute; kUnreachable if never)
+    int block_deviation{-1};         // index of the injected delay that blocks it, or -1
+    int failure_deviation{-1};       // index of the injected outcome failure that ends it, or -1
+    TimeMs failure_ms{0};            // when that outcome failure happens (if not timed out first)
   };
+  // Marks the injected deviations of attempt `a` that have happened by time t.
+  void mark_realized(const Attempt & a, TimeMs t);
 
   TimeMs true_duration(Index j, Index r, int attempt) const;
   TimeMs worked_ms(const Attempt & a, TimeMs t) const;   // working time done at time t
@@ -276,6 +287,7 @@ private:
   void install_or_throw(const Plan & new_plan, const std::vector<Index> & edited, TimeMs release_ms);
   // Per (task, robot): the robot reported a persistent obstruction on that task (row-major).
   std::vector<bool> persistent_pair_;
+  std::vector<bool> realized_;          // per injected deviation: it happened
   bool started_{false};                 // the first step processes time 0
   bool finished_{false};                // the run is over (statuses finalized)
 };
