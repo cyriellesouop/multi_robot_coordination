@@ -22,11 +22,22 @@
 // obstruction reported by the robot makes the task unreachable on it), trigger k = 3,
 // epsilon = 0, tau = 2 s. The same seeds for every deviation type (same graphs).
 //
-// Usage:   ros2 run actions dwafp_experiments [runs_per_type] [csv_file] [noise]
-// Default: 200 runs per deviation type, no CSV, noise 0 (the controlled configuration). A noise
-// level > 0 (e.g. 0.1) runs the same comparison under duration noise (robustness).
+// Usage, main comparison:
+//   ros2 run actions dwafp_experiments [runs_per_type] [csv_file] [noise]
+//   default: 200 runs per deviation type, no CSV, noise 0 (the controlled configuration); a noise
+//   level > 0 (e.g. 0.1) runs the same comparison under duration noise (robustness).
+// Usage, Step 6 sweeps (one factor changed at a time, everything else as in the controlled
+// configuration, the same paired scenarios for every setting):
+//   ros2 run actions dwafp_experiments <experiment> [runs] [csv_file]
+//   deadlines : deadlines on every task vs on handoff and final tasks only; overall and per shape
+//   noise     : duration noise 0, 5, 10, 20 %
+//   latency   : dispatch latency 0, 1, 3 s
+//   estimator : nominal vs conservative remaining-time estimate while blocked
+//   timeout   : execution timeout 1.5, 2, 3 x the nominal duration
+//   sweeps    : all of the above
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -215,9 +226,183 @@ void print_by_source_class(const std::vector<Row> & rows)
   }
 }
 
+// =============================================================================================
+// Step 6: sweeps (one factor at a time) with a compact one-line summary per setting
+// =============================================================================================
+
+struct DevType
+{
+  const char * name;
+  DeviationMix mix;
+};
+const DevType kTransient{"transient delay", {1, 0, 0, 0}};
+const DevType kPersistent{"persistent obstruction", {0, 1, 0, 0}};
+const DevType kFailure{"outcome failure", {0, 0, 1, 0}};
+const DevType kBreakdown{"robot breakdown", {0, 0, 0, 1}};
+const DevType kMix{"mix 35/25/25/15", DeviationMix{}};
+const WorkflowShape kShapes[] = {WorkflowShape::kRandomDag, WorkflowShape::kChains,
+  WorkflowShape::kForkJoin, WorkflowShape::kRendezvous};
+
+// Runs `runs` paired scenarios (seeds 1..runs) of one setting for one deviation type: every
+// scenario under the five methods. With cycle_shapes, the four shapes in turn (seed mod 4).
+std::vector<Row> run_setting(const std::string & experiment, ScenarioConfig base, const ControllerConfig & controller,
+  const DevType & type, int runs, bool cycle_shapes, std::ofstream * csv, int & errors)
+{
+  std::vector<Row> rows;
+  for (int i = 1; i <= runs; ++i) {
+    ScenarioConfig c = base;
+    c.mix = type.mix;
+    if (cycle_shapes) {c.shape = kShapes[static_cast<std::size_t>(i % 4)];}
+    const auto seed = static_cast<std::uint64_t>(i);
+    const Scenario s = make_scenario(c, seed);
+    Row row;
+    row.seed = seed;
+    row.source_class = s.source_class;
+    for (int k = 0; k < kMethodCount; ++k) {
+      ControllerConfig cc = controller;
+      cc.method = kMethods[k];
+      row.result[k] = run_method(s, cc);
+      errors += row.result[k].stats.errors;
+      if (csv) {write_csv_row(*csv, experiment, s, c, cc, type.name, row.result[k]);}
+    }
+    rows.push_back(row);
+  }
+  return rows;
+}
+
+void summary_header(const char * factor)
+{
+  std::printf("  %-24s %-23s %-13s %-11s %-34s %-34s %-6s %s\n", factor, "deviation", "success R/S/D",
+    "missRate R/D", "DWAFP-reactive [95% CI] W/T/L", "DWAFP-source-only [95% CI] W/T/L", "D-M", "harm/unneeded");
+}
+
+// One line: the setting, then the key outcomes and the paired comparisons of DWAFP.
+void summary_row(const std::string & label, const DevType & type, const std::vector<Row> & rows)
+{
+  const auto mean = [&](int k, auto metric) {
+      double acc = 0;
+      for (const Row & row : rows) {acc += metric(row.result[k]);}
+      return acc / static_cast<double>(std::max<std::size_t>(1, rows.size()));
+    };
+  const auto success = [](const RunResult & r) {return r.success ? 100.0 : 0.0;};
+  const auto rate = [](const RunResult & r) {return 100.0 * r.deadline_miss_rate();};
+  const auto misses_of = [&](int k) {
+      std::vector<double> v;
+      for (const Row & row : rows) {v.push_back(row.result[k].deadline_misses);}
+      return v;
+    };
+  const PairedSummary vr = compare(misses_of(kDwafp), misses_of(1));
+  const PairedSummary vs = compare(misses_of(kDwafp), misses_of(2));
+  const PairedSummary vm = compare(misses_of(kDwafp), misses_of(4));
+  int harmful = 0, unneeded = 0;
+  for (const Row & row : rows) {
+    const RunResult & d = row.result[kDwafp];
+    const RunResult & none = row.result[kNone];
+    if (d.deadline_misses > none.deadline_misses) {++harmful;}
+    if (d.edits_installed > 0 && none.success) {++unneeded;}
+  }
+  char a[64], b[64];
+  std::snprintf(a, sizeof a, "%+5.2f [%+5.2f,%+5.2f] %3d/%3d/%d", vr.mean_diff, vr.ci_lo, vr.ci_hi, vr.wins, vr.ties, vr.losses);
+  std::snprintf(b, sizeof b, "%+5.2f [%+5.2f,%+5.2f] %3d/%3d/%d", vs.mean_diff, vs.ci_lo, vs.ci_hi, vs.wins, vs.ties, vs.losses);
+  std::printf("  %-24s %-23s %3.0f/%3.0f/%3.0f   %4.1f/%4.1f   %-34s %-34s %+5.2f  %d/%d\n", label.c_str(), type.name,
+    mean(1, success), mean(2, success), mean(kDwafp, success), mean(1, rate), mean(kDwafp, rate), a, b,
+    vm.mean_diff, harmful, unneeded);
+}
+
+ScenarioConfig controlled_scenario()
+{
+  ScenarioConfig c;   // 4 robots, 20 tasks, every-task deadlines, slack 0.5-3, 2x timeout
+  c.noise = 0.0;
+  return c;
+}
+
+void exp_deadlines(int runs, std::ofstream * csv, int & errors)
+{
+  std::printf("\n### deadlines: on every task vs on handoff and final tasks only (all shapes in turn)\n");
+  summary_header("deadline structure");
+  for (const DeadlineStructure d : {DeadlineStructure::kEveryTask, DeadlineStructure::kHandoffAndFinal}) {
+    for (const DevType & t : {kTransient, kPersistent, kFailure, kBreakdown}) {
+      ScenarioConfig c = controlled_scenario();
+      c.deadlines = d;
+      summary_row(deadline_structure_name(d), t,
+        run_setting(std::string("deadlines:") + deadline_structure_name(d), c, controller_config(Method::kDwafp), t, runs, true, csv, errors));
+    }
+  }
+  std::printf("\n### deadlines per workflow shape (delays only)\n");
+  summary_header("shape / deadlines");
+  for (const WorkflowShape shape : kShapes) {
+    for (const DeadlineStructure d : {DeadlineStructure::kEveryTask, DeadlineStructure::kHandoffAndFinal}) {
+      for (const DevType & t : {kTransient, kPersistent}) {
+        ScenarioConfig c = controlled_scenario();
+        c.shape = shape;
+        c.deadlines = d;
+        const std::string label = std::string(shape_name(shape)) + " / " + deadline_structure_name(d);
+        summary_row(label, t, run_setting("deadlines-shape:" + label, c, controller_config(Method::kDwafp), t, runs, false, csv, errors));
+      }
+    }
+  }
+}
+
+void exp_noise(int runs, std::ofstream * csv, int & errors)
+{
+  std::printf("\n### noise: duration noise of every attempt\n");
+  summary_header("noise");
+  for (const double noise : {0.0, 0.05, 0.10, 0.20}) {
+    for (const DevType & t : {kTransient, kPersistent, kFailure, kBreakdown}) {
+      ScenarioConfig c = controlled_scenario();
+      c.noise = noise;
+      const std::string label = std::to_string(static_cast<int>(100 * noise + 0.5)) + " %";
+      summary_row(label, t, run_setting("noise:" + label, c, controller_config(Method::kDwafp), t, runs, true, csv, errors));
+    }
+  }
+}
+
+void exp_latency(int runs, std::ofstream * csv, int & errors)
+{
+  std::printf("\n### latency: dispatch latency between the decision and its activation (every method)\n");
+  summary_header("latency");
+  for (const TimeMs latency : {0, 1000, 3000}) {
+    for (const DevType & t : {kTransient, kPersistent}) {
+      ControllerConfig cc = controller_config(Method::kDwafp);
+      cc.dispatch_ms = latency;
+      const std::string label = std::to_string(latency / 1000) + " s";
+      summary_row(label, t, run_setting("latency:" + label, controlled_scenario(), cc, t, runs, true, csv, errors));
+    }
+  }
+}
+
+void exp_estimator(int runs, std::ofstream * csv, int & errors)
+{
+  std::printf("\n### estimator: remaining-time estimate while blocked (every method)\n");
+  summary_header("estimator");
+  for (const BlockageEstimate e : {BlockageEstimate::kNominal, BlockageEstimate::kConservative}) {
+    for (const DevType & t : {kTransient, kPersistent}) {
+      ControllerConfig cc = controller_config(Method::kDwafp);
+      cc.estimate = e;
+      summary_row(estimate_name(e), t, run_setting(std::string("estimator:") + estimate_name(e), controlled_scenario(), cc, t, runs, true, csv, errors));
+    }
+  }
+}
+
+void exp_timeout(int runs, std::ofstream * csv, int & errors)
+{
+  std::printf("\n### timeout: execution budget of an attempt, x its nominal duration (the same for every method)\n");
+  summary_header("timeout multiplier");
+  for (const double lambda : {1.5, 2.0, 3.0}) {
+    for (const DevType & t : {kTransient, kPersistent, kFailure, kBreakdown}) {
+      ScenarioConfig c = controlled_scenario();
+      c.timeout_multiplier = lambda;
+      char label[16];
+      std::snprintf(label, sizeof label, "%.1fx", lambda);
+      summary_row(label, t, run_setting(std::string("timeout:") + label, c, controller_config(Method::kDwafp), t, runs, true, csv, errors));
+    }
+  }
+}
+
 }  // namespace
 
-int main(int argc, char ** argv)
+// The main comparison (Step 5): full tables per deviation type.
+int main_comparison(int argc, char ** argv)
 {
   const int runs = argc > 1 ? std::max(1, std::atoi(argv[1])) : 200;
   const double noise = argc > 3 ? std::atof(argv[3]) : 0.0;
@@ -293,3 +478,46 @@ int main(int argc, char ** argv)
   if (csv) {std::printf("CSV written to %s\n", argv[2]);}
   return errors == 0 ? 0 : 1;
 }
+
+int main(int argc, char ** argv)
+{
+  // A first argument that is not a number names a Step 6 experiment.
+  if (argc > 1 && !std::isdigit(static_cast<unsigned char>(argv[1][0]))) {
+    const std::string name = argv[1];
+    const int runs = argc > 2 ? std::max(1, std::atoi(argv[2])) : 200;
+    std::ofstream csv_file;
+    std::ofstream * csv = nullptr;
+    if (argc > 3) {
+      csv_file.open(argv[3]);
+      if (!csv_file) {
+        std::fprintf(stderr, "cannot write %s\n", argv[3]);
+        return 1;
+      }
+      csv = &csv_file;
+      write_csv_header(*csv);
+    }
+    std::printf("DWAFP Step 6 experiment '%s': %d paired runs per setting and deviation type\n", name.c_str(), runs);
+    std::printf("Everything else as in the controlled configuration (4 robots, 20 tasks, every-task deadlines,\n"
+      "slack 0.5-3, no noise, 2x timeout, no latency, nominal estimate, k=3, eps=0, tau=2 s).\n"
+      "Columns: success of reactive / source-only / DWAFP; deadline-miss rate of reactive / DWAFP; paired\n"
+      "difference in misses per run (negative = DWAFP better) with its 95%% CI and W/T/L; D-M = DWAFP -\n"
+      "mission-wide; DWAFP runs that were harmful (more misses than no intervention) / unneeded.\n");
+    int errors = 0;
+    const bool all = name == "sweeps";
+    bool known = false;
+    if (all || name == "deadlines") {exp_deadlines(runs, csv, errors); known = true;}
+    if (all || name == "noise") {exp_noise(runs, csv, errors); known = true;}
+    if (all || name == "latency") {exp_latency(runs, csv, errors); known = true;}
+    if (all || name == "estimator") {exp_estimator(runs, csv, errors); known = true;}
+    if (all || name == "timeout") {exp_timeout(runs, csv, errors); known = true;}
+    if (!known) {
+      std::fprintf(stderr, "unknown experiment '%s' (deadlines, noise, latency, estimator, timeout, sweeps)\n", name.c_str());
+      return 1;
+    }
+    std::printf("\ncontroller errors (must be 0): %d\n", errors);
+    if (csv) {std::printf("CSV written to %s\n", argv[3]);}
+    return errors == 0 ? 0 : 1;
+  }
+  return main_comparison(argc, argv);
+}
+

@@ -4,7 +4,7 @@ Living document: every result that may go into the paper, with its configuration
 file and the command that reproduces it. Newest results are added to the relevant section; the
 "Claims" table at the end says what each result supports.
 
-Last update: 2026-10-21.
+Last update: 2026-10-21 (Step 6 sweeps added: Section 1.8).
 
 ---
 
@@ -19,7 +19,11 @@ colcon build --packages-select actions
 
 ./build/actions/dwafp_experiments 200 src/results/main_noise0.csv 0      # controlled
 ./build/actions/dwafp_experiments 200 src/results/main_noise10.csv 0.1   # robustness
+./build/actions/dwafp_experiments sweeps 200 src/results/sweeps.csv > src/results/sweeps.txt   # Section 1.8
 ```
+
+`sweeps` runs the five Step 6 experiments of Section 1.8 (about 45 s); each can also be run alone:
+`deadlines`, `noise`, `latency`, `estimator`, `timeout`.
 
 | Argument | Meaning |
 |---|---|
@@ -231,6 +235,95 @@ scenario and method, with the configuration in every line); full terminal output
 
 ---
 
+### 1.8 Sensitivity and robustness (Step 6)
+
+One factor is changed at a time; everything else is the controlled configuration of 1.1, on the
+same 200 paired scenarios per row (shapes in turn). Columns: success of reactive / source-only /
+DWAFP; deadline-miss rate of reactive / DWAFP; paired differences in misses per run (negative =
+DWAFP better) with 95 % CI and W / T / L; harmful / unneeded DWAFP runs. DWAFP − mission-wide was
+0.00 (all ties) in **every** row. Data: [sweeps.csv](sweeps.csv), full output: [sweeps.txt](sweeps.txt).
+
+#### Deadline structure: every task vs handoff and final tasks only
+
+| Deadlines | Deviation | Success R / S / D | Miss rate R / D | DWAFP − reactive | DWAFP − source-only | Harm / unneeded |
+|---|---|---|---|---|---|---|
+| every task | transient delay | 70 / 86 / 86 % | 2.9 / 1.2 % | −0.34 [−0.47, −0.23], 39/161/0 | −0.02 [−0.06, 0.00], 2/198/0 | 0 / 0 |
+| every task | persistent obstruction | 8 / 65 / 65 % | 18.4 / 8.1 % | −2.06 [−2.46, −1.70], 115/85/0 | 0.00, 200 ties | 0 / 0 |
+| handoff + final | transient delay | 78 / 90 / 91 % | 3.0 / 0.9 % | −0.24 [−0.34, −0.15], 31/169/0 | −0.01 [−0.04, 0.00], 1/199/0 | 0 / 0 |
+| handoff + final | persistent obstruction | 20 / 79 / 79 % | 20.8 / 6.3 % | −1.58 [−1.91, −1.28], 117/83/0 | 0.00, 200 ties | 0 / 0 |
+
+(Sudden failures and breakdowns: 200 ties against reactive and source-only in both structures.)
+
+Per shape (delays): the gain over reactive holds for every shape, largest for fork-join
+(persistent: −3.37 every task, −2.94 handoff + final) and smallest for rendezvous (−0.71 / −0.58).
+Against source-only, the only intervals that exclude 0 are small: −0.04 to −0.07 misses per run
+for transient delays on random DAG, chains and fork-join (4–5 wins, 0 losses); persistent: 200
+ties in every shape. Rendezvous is the weakest shape: the transient gain over reactive is small
+(−0.10 / −0.09), DWAFP loses 1 scenario to reactive and 1 to source-only, and 1–4 of its runs
+are harmful (an edit on a rendezvous partner can delay the meeting).
+
+**Finding.** Handoff-and-final deadlines did **not** create a gap between DWAFP and source-only
+repair. In these workflows the most effective single edit after a delay is to move the delayed
+task itself; repairing elsewhere rarely adds anything. The claim "dependency-aware repair
+outperforms source-only repair" remains unsupported (see 3 and 5).
+
+#### Duration noise
+
+| Noise | Transient: DWAFP − reactive | Persistent: DWAFP − reactive | Failure / breakdown: DWAFP − reactive | DWAFP − source-only (delays) | Unneeded (transient) |
+|---|---|---|---|---|---|
+| 0 % | −0.34 [−0.47, −0.23] | −2.06 [−2.46, −1.70] | 0.00 / 0.00 | −0.02 / 0.00 | 0 |
+| 5 % | −0.34 [−0.46, −0.24] | −2.12 [−2.52, −1.76] | −0.03 / −0.04 | −0.03 / −0.01 | 3 |
+| 10 % | −0.34 [−0.47, −0.24] | −2.10 [−2.50, −1.74] | −0.06 / −0.06 | −0.03 / −0.02 | 7 |
+| 20 % | −0.39 [−0.52, −0.28] | −1.95 [−2.33, −1.57] | −0.17 / −0.20 | 0.00 / −0.06 | 7 |
+
+The preventive gain on delays is stable up to 20 % noise. With noise DWAFP loses a few
+scenarios (at most 2 / 200 to reactive, at most 4 / 200 to source-only, every interval against
+source-only containing 0). The growing gain on failures and
+breakdowns comes from preventing noise-induced delays, not from the injected event. Unneeded
+interventions stay rare (at most 7 / 200); harmful ones at most 4 / 200 (20 %, breakdowns).
+
+#### Dispatch latency (decision to activation, the same for every method)
+
+| Latency | Transient: DWAFP − reactive | Persistent: DWAFP − reactive | Persistent success R / D | Transient: DWAFP − source-only |
+|---|---|---|---|---|
+| 0 s | −0.34 [−0.47, −0.23] | −2.06 [−2.46, −1.70] | 8 / 65 % | −0.02 [−0.06, 0.00] |
+| 1 s | −0.36 [−0.49, −0.24] | −1.59 [−1.95, −1.27] | 5 / 48 % | −0.02 [−0.06, 0.00] |
+| 3 s | −0.33 [−0.47, −0.20] | −1.11 [−1.47, −0.79] | 2 / 26 % | **−0.06 [−0.10, −0.01], 7/193/0** |
+
+Latency hurts prevention of persistent obstructions (the rescued task starts later), but the gain
+over reactive remains significant at 3 s. With 3 s of latency, DWAFP beats source-only on transient
+delays in 7 scenarios and never loses: downstream edits can absorb the latency (their task waits
+for its inputs anyway), which edits of the source cannot. This is the first condition where
+alternative repair locations matter (small effect).
+
+#### Remaining-time estimator while blocked
+
+| Estimator | Transient: DWAFP − reactive | Persistent: DWAFP − reactive | Transient: DWAFP − source-only | Unneeded (transient) |
+|---|---|---|---|---|
+| nominal (primary) | −0.34 [−0.47, −0.23] | −2.06 [−2.46, −1.70] | −0.02, 2/198/0 | 0 |
+| conservative | −0.35 [−0.48, −0.25] | −2.06 [−2.46, −1.70] | +0.01, 1/197/2 | 12 |
+
+The benefit does not depend on the estimation assumption. The conservative estimate adds 12
+unneeded interventions for transient delays and 2 losses against source-only, which supports the
+nominal estimate as the primary configuration. Persistent obstructions are unaffected, since both
+estimators use the robot's explicit diagnostic.
+
+#### Execution timeout λ (robot-side budget, the same for every method)
+
+| λ | Transient: DWAFP − reactive | Persistent: DWAFP − reactive | Persistent success R / D | Transient success R / D |
+|---|---|---|---|---|
+| 1.5 | −0.17 [−0.26, −0.09], 21/177/2 | −1.15 [−1.39, −0.91] | 18 / 65 % | 51 / 55 % |
+| 2.0 (primary) | −0.34 [−0.47, −0.23], 39/161/0 | −2.06 [−2.46, −1.70] | 8 / 65 % | 70 / 86 % |
+| 3.0 | −0.34 [−0.47, −0.23], 39/161/0 | −3.00 [−3.50, −2.54] | 1 / 65 % | 70 / 86 % |
+
+For persistent obstructions the gain over reactive grows with the timeout: the longer the robot waits before
+declaring failure, the later reactive recovery starts, while DWAFP acts on the feedback either way.
+A tight budget (1.5) turns many transient delays into timeouts for every method (success 51–56 %)
+and halves the transient gain (λ = 3 changes nothing for transient delays, which end before 2×); DWAFP then loses 2 of 200 scenarios. The gain remains significant
+for every λ. λ = 2 is used for the main results without tuning it for any method.
+
+---
+
 ## 2. Stage I at the prediction level (open loop, earlier)
 
 These results evaluate single-edit candidates on **predictions** (no execution); program
@@ -263,10 +356,12 @@ One row per claim the paper may make. Evidence: the sections supporting it. Stat
 
 | Claim | Evidence | Status |
 |---|---|---|
-| Prevention improves over reactive recovery | 1.2, 1.3: −0.34 and −2.06 misses/run on delays, no losses | **Supported** |
+| Prevention improves over reactive recovery | 1.2, 1.3: −0.34 and −2.06 misses/run on delays, no losses; 1.8: significant for every deadline structure, shape, noise level up to 20 %, latency up to 3 s, both estimators and every timeout | **Supported** |
 | Shared recovery behaves identically after unannounced failures | 1.2: 200 ties for failures and breakdowns | **Supported** |
-| The benefit is robust to duration noise | 1.3 | **Supported (10 %)**; noise sweep pending |
-| Dependency-aware repair outperforms source-only repair | 1.4: nearly identical | **Not yet supported** (handoff+final deadlines pending) |
+| The benefit is robust to duration noise | 1.3, 1.8: stable from 0 to 20 % noise | **Supported** |
+| The benefit does not depend on the blockage estimator | 1.8: nominal and conservative give the same gains | **Supported** (nominal has fewer unneeded edits) |
+| The gain over reactive depends on the execution timeout | 1.8: −1.15 / −2.06 / −3.00 for λ = 1.5 / 2 / 3 (persistent) | **Reported** (λ = 2 untuned) |
+| Dependency-aware repair outperforms source-only repair | 1.4, 1.8: nearly identical, also with handoff-and-final deadlines; small gain only with 3 s latency (−0.06, 7/193/0) | **Not supported** in the tested workflows |
 | Local search preserves global single-edit quality | 1.4: 2000 ties; 2: 100 % kept | **Promising** (single-deviation scenarios only) |
 | Local search substantially reduces computation | 1.6: small difference at 20 tasks; 2: −40 % candidates | **Pending** (closed-loop scaling) |
 | No harmful or unneeded preventive edits | 1.2: none without noise; 1.3: 7 unneeded / 200 transient runs with noise | **Supported**, with the noise caveat |
@@ -290,10 +385,11 @@ One row per claim the paper may make. Evidence: the sections supporting it. Stat
 
 ## 5. Pending (Step 6)
 
-1. Deadline structure: handoff + final deadlines (where alternative repair locations should matter).
-2. Noise sweep: 0, 5, 10, 20 %.
-3. Dispatch latency: 0, 1, 3 s.
-4. Estimator: nominal vs conservative.
-5. Execution timeout λ ∈ {1.5, 2, 3} (λ = 2 primary, the same for every method).
-6. Closed-loop scaling with homogeneous rates or R ∈ {3, 6, 9, 12}.
-7. Failure taxonomy of the events DWAFP cannot prevent (7 classes, with a pair oracle).
+Done (1.8): deadline structure, noise sweep, dispatch latency, estimator, execution timeout.
+
+Still to run:
+1. Closed-loop scaling with homogeneous rates or R ∈ {3, 6, 9, 12}.
+2. Failure taxonomy of the events DWAFP cannot prevent (7 classes, with a pair oracle).
+3. Conditions where repairing at other locations should matter (to test the remaining claim
+   directly): a source late in its progress (moving it discards most of the work), a busy fleet
+   (few idle robots), larger dispatch latency, and very heterogeneous robot speeds.
