@@ -48,6 +48,8 @@ RunResult run(const Scenario & s, Method method)
 //   reactive       : T1 -> robot3 10-14 s (on time), T2 restarted on robot3 16-20 s (4 s late)
 //                    -> 1 miss, 0 never completed, tardiness 4 s, both tasks moved, 2 edits
 //   DWAFP          : T1 -> robot3 3.5-7.5 s, T2 7.5-15 s -> success, 1 edit, 1 task moved
+// Added delay w.r.t. the nominal plan (T1 0-5 s on robot1, T2 5-12.5 s on robot2), completed tasks:
+//   no intervention 0 (nothing completed), reactive 9 + 7.5 = 16.5 s, DWAFP 2.5 + 2.5 = 5 s
 TEST(Runner, MetricsOfTheHeadlineWorld)
 {
   const Scenario s = headline();
@@ -58,6 +60,7 @@ TEST(Runner, MetricsOfTheHeadlineWorld)
   EXPECT_FALSE(none.success);
   EXPECT_EQ(none.timeouts, 1);
   EXPECT_EQ(none.edits_scheduled, 0);
+  EXPECT_EQ(none.added_delay_ms, 0);
   EXPECT_TRUE(none.deviation_realized);  // the obstruction was reached
   EXPECT_DOUBLE_EQ(none.deadline_miss_rate(), 1.0);
   EXPECT_DOUBLE_EQ(none.completion_rate(), 0.0);
@@ -70,6 +73,7 @@ TEST(Runner, MetricsOfTheHeadlineWorld)
   EXPECT_EQ(reactive.final_assignment_changes, 2);
   EXPECT_EQ(reactive.edits_installed, 2);
   EXPECT_EQ(reactive.stats.fallback_repairs, 2);
+  EXPECT_EQ(reactive.added_delay_ms, 16500);
 
   const RunResult dwafp = run(s, Method::kDwafp);
   EXPECT_TRUE(dwafp.success);
@@ -79,6 +83,8 @@ TEST(Runner, MetricsOfTheHeadlineWorld)
   EXPECT_EQ(dwafp.final_assignment_changes, 1);
   EXPECT_EQ(dwafp.edits_installed, 1);
   EXPECT_EQ(dwafp.stats.preventive_repairs, 1);
+  EXPECT_EQ(dwafp.stats.preventive_downstream, 0);  // it moved the source T1 itself
+  EXPECT_EQ(dwafp.added_delay_ms, 5000);
   EXPECT_TRUE(dwafp.deviation_realized);  // DWAFP reacted to the realized obstruction
   EXPECT_TRUE(dwafp.all_completed());
   EXPECT_EQ(dwafp.stats.decision_times_us.size(), static_cast<std::size_t>(dwafp.stats.analyses));
@@ -136,4 +142,38 @@ TEST(Runner, PairedComparison)
   EXPECT_EQ(again.ci_lo, x.ci_lo);
   EXPECT_EQ(again.ci_hi, x.ci_hi);
   EXPECT_THROW(dwafp::compare({1, 2}, {1}), std::invalid_argument);
+}
+
+// Cluster bootstrap. With one row per cluster it is compare(). When every row is repeated in 3
+// cells (the same seeds reused, as in pooled factor cells), treating the 3x rows as independent
+// gives a NARROWER interval than the data support; the cluster bootstrap gives the interval of
+// the 8 seeds, i.e. the same as one row per seed. Wins / ties / losses still count rows.
+TEST(Runner, ClusteredComparison)
+{
+  const std::vector<double> base{3, 1, 4, 1, 5, 9, 2, 6};
+  const std::vector<double> mixed{2, 1, 5, 1, 3, 9, 2, 4};  // diffs -1 0 +1 0 -2 0 0 -2
+  std::vector<std::uint64_t> ids{1, 2, 3, 4, 5, 6, 7, 8};
+  const auto plain = dwafp::compare(mixed, base, 7, 10000);
+  const auto one_per_cluster = dwafp::compare_clustered(mixed, base, ids, 7, 10000);
+  EXPECT_DOUBLE_EQ(one_per_cluster.mean_diff, plain.mean_diff);
+  EXPECT_DOUBLE_EQ(one_per_cluster.ci_lo, plain.ci_lo);
+  EXPECT_DOUBLE_EQ(one_per_cluster.ci_hi, plain.ci_hi);
+
+  std::vector<double> m3, b3;
+  std::vector<std::uint64_t> ids3;
+  for (int cell = 0; cell < 3; ++cell) {  // the same 8 seeds in 3 factor cells
+    m3.insert(m3.end(), mixed.begin(), mixed.end());
+    b3.insert(b3.end(), base.begin(), base.end());
+    ids3.insert(ids3.end(), ids.begin(), ids.end());
+  }
+  const auto naive = dwafp::compare(m3, b3, 7, 10000);
+  const auto clustered = dwafp::compare_clustered(m3, b3, ids3, 7, 10000);
+  EXPECT_DOUBLE_EQ(clustered.mean_diff, -0.5);
+  EXPECT_DOUBLE_EQ(clustered.ci_lo, plain.ci_lo);   // the information of 8 seeds, not 24 runs
+  EXPECT_DOUBLE_EQ(clustered.ci_hi, plain.ci_hi);
+  EXPECT_GT(clustered.ci_hi - clustered.ci_lo, naive.ci_hi - naive.ci_lo);  // naive is too narrow
+  EXPECT_EQ(clustered.n, 24);
+  EXPECT_EQ(clustered.wins, 9);
+  EXPECT_EQ(clustered.losses, 3);
+  EXPECT_THROW(dwafp::compare_clustered(mixed, base, {1, 2}), std::invalid_argument);
 }

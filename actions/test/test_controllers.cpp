@@ -314,6 +314,8 @@ TEST(Controllers, DwafpRepairsDownstreamWhereSourceOnlyCannot)
     SCOPED_TRACE(dwafp::method_name(method));
     EXPECT_EQ(o.stats.preventive_repairs, 1);
     EXPECT_EQ(o.stats.preventive_downstream, 1);         // the edit moved T2, not the source
+    EXPECT_EQ(o.stats.preventive_installed, 1);          // no latency: installed when scheduled
+    EXPECT_EQ(o.stats.preventive_downstream_installed, 1);
     EXPECT_EQ(o.records[t1].robot, m.robot_index("robot1"));
     EXPECT_EQ(o.records[t1].end_ms, 8000);
     EXPECT_EQ(o.records[t1].discarded_work_ms, 0);        // the source's progress is kept

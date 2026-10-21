@@ -3,6 +3,7 @@
 #include "actions/runner.hpp"
 
 #include <algorithm>  // std::max, std::sort
+#include <map>
 #include <random>
 #include <stdexcept>
 
@@ -16,6 +17,12 @@ RunResult run_method(const Scenario & scenario, const ControllerConfig & config)
   Simulator sim(m, scenario.plan, scenario.world);
   const std::vector<TaskRecord> & rec = sim.run(&controller);
 
+  // Nominal prediction of the initial plan (no deviation, nominal durations): the reference of
+  // added_delay_ms.
+  const RuntimeState s0 = RuntimeState::initial(m);
+  const DurationSnapshot p0 = DurationSnapshot::capture(m, ConfigDurationModel{}, s0);
+  const Prediction nominal = Predictor(m, scenario.plan, s0, p0).full();
+
   RunResult r;
   r.total_tasks = static_cast<int>(m.task_count());
   for (Index j = 0; j < m.task_count(); ++j) {
@@ -24,6 +31,7 @@ RunResult run_method(const Scenario & scenario, const ControllerConfig & config)
     if (completed) {
       ++r.completed_tasks;
       r.makespan_ms = std::max(r.makespan_ms, t.end_ms);
+      r.added_delay_ms += std::max<TimeMs>(0, t.end_ms - nominal.tasks[j].finish_ms);
     } else {
       ++r.never_completed;
     }
@@ -82,6 +90,32 @@ PairedSummary compare(const std::vector<double> & method, const std::vector<doub
     };
   s.ci_lo = at(0.025);
   s.ci_hi = at(0.975);
+  return s;
+}
+
+PairedSummary compare_clustered(const std::vector<double> & method, const std::vector<double> & baseline,
+  const std::vector<std::uint64_t> & cluster, std::uint64_t seed, int resamples)
+{
+  if (method.size() != baseline.size() || method.size() != cluster.size()) {
+    throw std::invalid_argument("compare_clustered: different sizes");
+  }
+  // Mean paired difference of every cluster (ordered by cluster id, so the result is deterministic).
+  std::map<std::uint64_t, std::pair<double, int>> per_cluster;  // id -> (sum of differences, rows)
+  for (std::size_t i = 0; i < method.size(); ++i) {
+    auto & c = per_cluster[cluster[i]];
+    c.first += method[i] - baseline[i];
+    ++c.second;
+  }
+  std::vector<double> cluster_means;
+  for (const auto & [id, c] : per_cluster) {cluster_means.push_back(c.first / c.second);}
+  // Bootstrap of the cluster means: compare() of the means against 0 does exactly that.
+  PairedSummary s = compare(cluster_means, std::vector<double>(cluster_means.size(), 0.0), seed, resamples);
+  // Wins, ties and losses (and n) describe the individual paired runs, not the clusters.
+  const PairedSummary rows = compare(method, baseline, seed, 1);
+  s.n = rows.n;
+  s.wins = rows.wins;
+  s.ties = rows.ties;
+  s.losses = rows.losses;
   return s;
 }
 

@@ -132,7 +132,18 @@ void MethodController::on_deadline_missed(Index task, TimeMs /*time_ms*/)
 void MethodController::on_edit_installed(bool installed, TimeMs /*time_ms*/)
 {
   edit_in_flight_ = false;
-  if (!installed) {refresh_reference_ = true;}  // the accepted plan did not happen
+  if (installed) {
+    count_installed(in_flight_preventive_, in_flight_downstream_);
+  } else {
+    refresh_reference_ = true;  // the accepted plan did not happen
+  }
+}
+
+void MethodController::count_installed(bool preventive, bool downstream)
+{
+  if (!preventive) {return;}
+  ++stats_.preventive_installed;
+  if (downstream) {++stats_.preventive_downstream_installed;}
 }
 
 // ----------------------------------------------------------------------------------------------
@@ -176,7 +187,7 @@ Prediction MethodController::predict(const Simulator & sim, const RuntimeState &
 // Decisions
 // ----------------------------------------------------------------------------------------------
 
-void MethodController::schedule(Simulator & sim, const RepairCandidate & candidate)
+void MethodController::schedule(Simulator & sim, const RepairCandidate & candidate, bool preventive, bool downstream)
 {
   const TimeMs activation = sim.now() + config_.decision_ms + config_.dispatch_ms;
   try {
@@ -187,6 +198,13 @@ void MethodController::schedule(Simulator & sim, const RepairCandidate & candida
     return;
   }
   edit_in_flight_ = activation > sim.now();
+  if (edit_in_flight_) {
+    // Installed (or rejected) at its activation: on_edit_installed() counts it then.
+    in_flight_preventive_ = preventive;
+    in_flight_downstream_ = downstream;
+  } else {
+    count_installed(preventive, downstream);  // no latency: installed now (it would have thrown)
+  }
   // The candidate's prediction is the newly accepted plan: the trigger measures against it.
   reference_ = candidate.prediction;
   trigger_.set_reference(reference_);
@@ -221,8 +239,9 @@ bool MethodController::try_preventive(Simulator & sim, const std::vector<Index> 
   // Repair location: a deviating task itself, or a task downstream of it (repair-location study).
   // Compared with the deviating tasks, not with d.impact.sources, which also contains the overdue
   // descendants rebuilt by expected_state() (see RepairConfig::deviating_tasks).
-  if (std::find(tasks.begin(), tasks.end(), chosen.task) == tasks.end()) {++stats_.preventive_downstream;}
-  schedule(sim, chosen);
+  const bool downstream = std::find(tasks.begin(), tasks.end(), chosen.task) == tasks.end();
+  if (downstream) {++stats_.preventive_downstream;}
+  schedule(sim, chosen, true, downstream);
   return true;
 }
 

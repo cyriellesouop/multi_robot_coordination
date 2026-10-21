@@ -334,3 +334,106 @@ TEST(Scenarios, SourceClassUsesAllDescendants)
   EXPECT_TRUE(found_indirect);  // such sources exist and are classified as handoffs
 }
 
+
+// Final-only deadlines: exactly the tasks without a dependency successor have one.
+TEST(Scenarios, FinalOnlyDeadlinesAreOnSinks)
+{
+  for (const WorkflowShape shape : kShapes) {
+    ScenarioConfig c;
+    c.shape = shape;
+    c.deadlines = DeadlineStructure::kFinalOnly;
+    const Scenario s = dwafp::make_scenario(c, 3);
+    for (Index j = 0; j < s.mission.task_count(); ++j) {
+      EXPECT_EQ(dwafp::has_deadline(s.mission, j), s.mission.dependency_successors(j).empty())
+        << dwafp::shape_name(shape) << " " << s.mission.task(j).id;
+    }
+  }
+}
+
+// Fixed source progress and the execution-time ratio: progress_lo == progress_hi fixes the share of
+// work done at the deviation; execution_time_ratio rho gives durations 1.0 / sqrt(rho) / rho s per
+// unit of work, cyclically.
+TEST(Scenarios, FixedProgressAndExecutionTimeRatio)
+{
+  ScenarioConfig c;
+  c.mix = {1, 0, 0, 0};
+  c.progress_lo = c.progress_hi = 0.8;
+  c.execution_time_ratio = 3.0;
+  for (std::uint64_t seed = 1; seed <= 20; ++seed) {
+    const Scenario s = dwafp::make_scenario(c, seed);
+    EXPECT_DOUBLE_EQ(s.deviation.at_fraction, 0.8);
+  }
+  const Scenario s = dwafp::make_scenario(c, 1);
+  EXPECT_DOUBLE_EQ(s.mission.robot(0).ms_per_work_unit, 1000.0);
+  EXPECT_DOUBLE_EQ(s.mission.robot(1).ms_per_work_unit, 1000.0 * std::sqrt(3.0));
+  EXPECT_DOUBLE_EQ(s.mission.robot(2).ms_per_work_unit, 3000.0);
+  EXPECT_DOUBLE_EQ(s.mission.robot(3).ms_per_work_unit, 1000.0);
+  c.execution_time_ratio = 1.0;  // homogeneous
+  const Scenario h = dwafp::make_scenario(c, 1);
+  for (Index r = 0; r < h.mission.robot_count(); ++r) {EXPECT_DOUBLE_EQ(h.mission.robot(r).ms_per_work_unit, 1000.0);}
+}
+
+// A spare robot has no task and changes nothing else: the same seed gives the same tasks, robots,
+// work, deadlines and deviation with or without it.
+TEST(Scenarios, SpareRobotsDoNotChangeTheWorkflow)
+{
+  ScenarioConfig c;
+  c.mix = {1, 0, 0, 0};
+  ScenarioConfig with_spare = c;
+  with_spare.spare_robots = 1;
+  for (std::uint64_t seed = 1; seed <= 20; ++seed) {
+    const Scenario a = dwafp::make_scenario(c, seed);
+    const Scenario b = dwafp::make_scenario(with_spare, seed);
+    ASSERT_EQ(b.mission.robot_count(), a.mission.robot_count() + 1);
+    EXPECT_TRUE(b.plan.queue(a.mission.robot_count()).empty());  // the spare is idle
+    ASSERT_EQ(a.mission.task_count(), b.mission.task_count());
+    for (Index j = 0; j < a.mission.task_count(); ++j) {
+      EXPECT_EQ(a.mission.task(j).robot, b.mission.task(j).robot);
+      EXPECT_EQ(a.mission.task(j).work, b.mission.task(j).work);
+      EXPECT_EQ(a.mission.task(j).deadline_ms, b.mission.task(j).deadline_ms);
+      EXPECT_EQ(a.mission.task(j).predecessors, b.mission.task(j).predecessors);
+    }
+    EXPECT_EQ(a.deviation.task, b.deviation.task);
+    EXPECT_EQ(a.deviation.delay_ms, b.deviation.delay_ms);
+  }
+}
+
+// busy_fleet: at the deviation (and 2 s later) every other workflow robot executes a task in the
+// nominal plan. It needs a fixed progress; an invalid rate ratio or spare count is refused.
+TEST(Scenarios, BusyFleetSourceHasEveryRobotBusy)
+{
+  for (const WorkflowShape shape : {WorkflowShape::kRandomDag, WorkflowShape::kRendezvous}) {
+    for (std::uint64_t seed = 1; seed <= 20; ++seed) {
+      ScenarioConfig c;
+      c.shape = shape;
+      c.mix = {1, 0, 0, 0};
+      c.busy_fleet = true;
+      c.progress_lo = c.progress_hi = 0.5;
+      const Scenario s = dwafp::make_scenario(c, seed);
+      const Index src = s.deviation.task;
+      const dwafp::RuntimeState s0 = dwafp::RuntimeState::initial(s.mission);
+      const dwafp::DurationSnapshot p = dwafp::DurationSnapshot::capture(s.mission, dwafp::ConfigDurationModel{}, s0);
+      const dwafp::Prediction nominal = dwafp::Predictor(s.mission, s.plan, s0, p).full();
+      const dwafp::TimeMs b = nominal.tasks[src].start_ms + std::llround(0.5 * static_cast<double>(p.at(src, s.plan.robot_of(src))));
+      for (Index r = 0; r < s.mission.robot_count(); ++r) {
+        if (r == s.plan.robot_of(src)) {continue;}
+        for (const dwafp::TimeMs t : {b, b + 2000}) {
+          bool executing = false;
+          for (const Index k : s.plan.queue(r)) {
+            executing = executing || (nominal.tasks[k].start_ms <= t && t < nominal.tasks[k].finish_ms);
+          }
+          EXPECT_TRUE(executing) << dwafp::shape_name(shape) << " seed " << seed << " robot " << r << " at " << t;
+        }
+      }
+    }
+  }
+  ScenarioConfig range;
+  range.busy_fleet = true;  // progress range 0.2..0.8: refused
+  EXPECT_THROW(dwafp::make_scenario(range, 1), std::invalid_argument);
+  ScenarioConfig ratio;
+  ratio.execution_time_ratio = 0.5;
+  EXPECT_THROW(dwafp::make_scenario(ratio, 1), std::invalid_argument);
+  ScenarioConfig spares;
+  spares.spare_robots = -1;
+  EXPECT_THROW(dwafp::make_scenario(spares, 1), std::invalid_argument);
+}

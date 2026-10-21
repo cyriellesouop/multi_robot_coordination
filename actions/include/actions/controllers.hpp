@@ -77,8 +77,12 @@ struct ControllerStats
   int preventive_repairs{0};   // ... a preventive repair was scheduled
   // ... of which the edited task is NOT a deviating task (one whose feedback fired the trigger): a
   // downstream edit (a dependency or queue successor on a path to a threatened task). Always 0
-  // for source-only.
+  // for source-only. These two count SCHEDULED repairs; with a dispatch latency an edit can still
+  // be rejected at its activation (its task completed meanwhile), so the next two count the
+  // preventive repairs actually INSTALLED (equal to the scheduled ones without latency).
   int preventive_downstream{0};
+  int preventive_installed{0};
+  int preventive_downstream_installed{0};
   int no_feasible_local{0};    // ... certificate: no permitted local repair
   int no_single_edit{0};       // ... no preventive single edit
   int fallback_events{0};      // tasks handed to the common recovery (failures, breakdowns, misses)
@@ -116,7 +120,10 @@ private:
   bool try_preventive(Simulator & sim, const std::vector<Index> & tasks);
   // Fallback recovery of one task; true if an edit was scheduled.
   bool try_recover(Simulator & sim, Index task);
-  void schedule(Simulator & sim, const RepairCandidate & candidate);
+  // `preventive` / `downstream`: what kind of repair this is, for the installed-edit counts.
+  void schedule(Simulator & sim, const RepairCandidate & candidate, bool preventive = false, bool downstream = false);
+  // Records an installed edit of that kind in the statistics.
+  void count_installed(bool preventive, bool downstream);
   void timed(double us);
 
   const Mission & mission_;
@@ -125,6 +132,8 @@ private:
   Prediction reference_;          // the accepted prediction (trigger reference, expected state)
   DeviationTrigger trigger_;
   bool edit_in_flight_{false};    // a scheduled edit waits for its activation
+  bool in_flight_preventive_{false};   // ... and its kind, counted when it is installed
+  bool in_flight_downstream_{false};
   bool refresh_reference_{false}; // an edit was rejected: rebuild the reference
   std::vector<Index> broken_robots_;  // breakdowns not yet handed to the recovery
   std::vector<Index> pending_trigger_;   // tasks with a trigger event (prevention)

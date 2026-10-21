@@ -3,7 +3,7 @@
 #include "actions/scenarios.hpp"
 
 #include <algorithm>  // std::max, std::min
-#include <cmath>      // std::llround
+#include <cmath>      // std::llround, std::sqrt
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -38,7 +38,12 @@ const char * source_class_name(SourceClass c)
 
 const char * deadline_structure_name(DeadlineStructure d)
 {
-  return d == DeadlineStructure::kEveryTask ? "every task" : "handoff+final";
+  switch (d) {
+    case DeadlineStructure::kEveryTask: return "every task";
+    case DeadlineStructure::kHandoffAndFinal: return "handoff+final";
+    case DeadlineStructure::kFinalOnly: return "final only";
+  }
+  return "?";
 }
 
 namespace
@@ -137,7 +142,12 @@ std::optional<Scenario> try_make_scenario(const ScenarioConfig & c, std::uint64_
 {
   if (c.robots < 1 || c.tasks < 2 || c.work_min < 1 || c.work_max < c.work_min ||
     c.slack_lo < 0.0 || c.slack_hi < c.slack_lo || c.delay_lo < 0.0 || c.delay_hi < c.delay_lo ||
-    !(c.window > 0.0 && c.window <= 1.0))
+    !(c.window > 0.0 && c.window <= 1.0) ||
+    // progress: a share of the work in [0, 1) (at 1 the task would already be done)
+    !(c.progress_lo >= 0.0 && c.progress_hi >= c.progress_lo && c.progress_hi < 1.0) ||
+    (c.execution_time_ratio != 0.0 && !(c.execution_time_ratio >= 1.0)) || c.spare_robots < 0 ||
+    // busy_fleet checks the fleet at ONE deviation time, so the progress must be fixed
+    (c.busy_fleet && c.progress_lo != c.progress_hi))
   {
     throw std::invalid_argument("make_scenario: invalid configuration");
   }
@@ -149,11 +159,17 @@ std::optional<Scenario> try_make_scenario(const ScenarioConfig & c, std::uint64_
   std::mt19937_64 rng(attempt == 0 ? seed : seed ^ (0x9E3779B97F4A7C15ULL * attempt));
   std::uniform_real_distribution<double> unit(0.0, 1.0);
 
-  // Robots: speeds cycle through 1.0 / 1.5 / 0.8 s per unit.
-  const double rates[] = {1000, 1500, 800};
+  // Robots: durations per unit of work cycle through 1.0 / 1.5 / 0.8 s (default), or
+  // 1.0 / sqrt(rho) / rho with an execution-time ratio rho, or all 1.0 (homogeneous_rates). Spares come after the workflow robots
+  // and continue the same cycle; build_structure() only assigns tasks to the first c.robots
+  // robots, and no random number is drawn here, so spares never change the drawn workflow.
+  const double legacy[] = {1000, 1500, 800};
+  const double rho = c.execution_time_ratio;
+  const double ratio_rates[] = {1000, 1000 * std::sqrt(rho), 1000 * rho};
   std::vector<Robot> fleet;
-  for (int r = 0; r < c.robots; ++r) {
-    fleet.push_back({"robot" + std::to_string(r + 1), c.homogeneous_rates ? 1000.0 : rates[r % 3]});
+  for (int r = 0; r < c.robots + c.spare_robots; ++r) {
+    const double rate = c.homogeneous_rates ? 1000.0 : (rho >= 1.0 ? ratio_rates[r % 3] : legacy[r % 3]);
+    fleet.push_back({"robot" + std::to_string(r + 1), rate});
   }
 
   // Structure and work.
@@ -171,7 +187,7 @@ std::optional<Scenario> try_make_scenario(const ScenarioConfig & c, std::uint64_
     for (const int h : preds[static_cast<std::size_t>(j)]) {t.predecessors.push_back(id(h));}
   }
 
-  // Which tasks get a deadline: every task, or handoff and final tasks only.
+  // Which tasks get a deadline: every task, handoff and final tasks, or final tasks only.
   std::vector<bool> gets_deadline(static_cast<std::size_t>(c.tasks), c.deadlines == DeadlineStructure::kEveryTask);
   if (c.deadlines == DeadlineStructure::kHandoffAndFinal) {
     std::vector<bool> has_successor(static_cast<std::size_t>(c.tasks), false);
@@ -185,6 +201,13 @@ std::optional<Scenario> try_make_scenario(const ScenarioConfig & c, std::uint64_
     }
     for (int j = 0; j < c.tasks; ++j) {
       if (!has_successor[static_cast<std::size_t>(j)]) {gets_deadline[static_cast<std::size_t>(j)] = true;}  // final
+    }
+  }
+  if (c.deadlines == DeadlineStructure::kFinalOnly) {
+    // Sinks only: a task that is the predecessor of another one has no deadline of its own.
+    std::fill(gets_deadline.begin(), gets_deadline.end(), true);
+    for (int j = 0; j < c.tasks; ++j) {
+      for (const int h : preds[static_cast<std::size_t>(j)]) {gets_deadline[static_cast<std::size_t>(h)] = false;}
     }
   }
 
@@ -223,13 +246,36 @@ std::optional<Scenario> try_make_scenario(const ScenarioConfig & c, std::uint64_
     // A task starting in the window (primary: one whose deviation can propagate through a
     // dependency; secondary: any task). No eligible task: this graph is rejected (regenerated).
     std::vector<Index> candidates;
+    // busy_fleet: robot r (a workflow robot, not a spare) executes some task at time t in the
+    // nominal plan.
+    const auto executing_at = [&](Index r, TimeMs t) {
+        for (const Index k : plan.queue(r)) {
+          if (nominal.tasks[k].start_ms <= t && t < nominal.tasks[k].finish_ms) {return true;}
+        }
+        return false;
+      };
     for (Index j = 0; j < mission.task_count(); ++j) {
       if (nominal.tasks[j].start_ms >= window_end) {continue;}
-      if (c.source == SourceSelection::kAny || !mission.dependency_successors(j).empty()) {candidates.push_back(j);}
+      if (c.source == SourceSelection::kWithDependents && mission.dependency_successors(j).empty()) {continue;}
+      if (c.busy_fleet) {
+        // Deviation time b with the fixed progress; every OTHER workflow robot must be executing
+        // at b and at b + 2 s (the source's own robot is busy with the deviating source).
+        const TimeMs b = nominal.tasks[j].start_ms +
+          std::llround(c.progress_lo * static_cast<double>(p.at(j, plan.robot_of(j))));
+        bool all_busy = true;
+        for (Index r = 0; r < static_cast<Index>(c.robots) && all_busy; ++r) {
+          if (r == plan.robot_of(j)) {continue;}
+          all_busy = executing_at(r, b) && executing_at(r, b + 2000);
+        }
+        if (!all_busy) {continue;}
+      }
+      candidates.push_back(j);
     }
     if (candidates.empty()) {return std::nullopt;}
     d.task = candidates[std::uniform_int_distribution<std::size_t>(0, candidates.size() - 1)(rng)];
-    d.at_fraction = 0.2 + 0.6 * unit(rng);
+    // One draw in every case (the stream does not depend on the progress setting); with the
+    // defaults 0.2 / 0.8 this is the original U[0.2, 0.8].
+    d.at_fraction = c.progress_lo + (c.progress_hi - c.progress_lo) * unit(rng);
     if (pick < c.mix.transient_delay) {
       d.type = DeviationType::kDelay;
       d.persistent = false;
@@ -299,7 +345,8 @@ std::optional<Scenario> try_make_scenario(const ScenarioConfig & c, std::uint64_
 
   const std::string description = std::string(shape_name(c.shape)) + ", " +
     deadline_structure_name(c.deadlines) + ", " + std::to_string(c.robots) + " robots, " +
-    std::to_string(c.tasks) + " tasks: " + what + " (" + source_class_name(source_class) + ")";
+    std::to_string(c.tasks) + " tasks" + (c.spare_robots ? " + " + std::to_string(c.spare_robots) + " spare" : std::string()) +
+    (c.busy_fleet ? ", busy fleet" : "") + ": " + what + " (" + source_class_name(source_class) + ")";
   return Scenario{std::move(mission), std::move(plan), std::move(world), d, source_class, makespan, description};
 }
 
@@ -313,8 +360,9 @@ Scenario make_scenario(const ScenarioConfig & c, std::uint64_t seed)
     if (auto s = try_make_scenario(c, seed, attempt)) {return std::move(*s);}
   }
   throw std::invalid_argument(
-          "make_scenario: no task with a dependency successor starts in the injection window "
-          "(after " + std::to_string(kAttempts) + " graphs); use SourceSelection::kAny or a denser workflow");
+          "make_scenario: no eligible source (a task with a dependency successor starting in the "
+          "injection window, with every workflow robot busy at its deviation if busy_fleet) after " +
+          std::to_string(kAttempts) + " graphs; use SourceSelection::kAny, a denser workflow, or no busy_fleet");
 }
 
 }  // namespace dwafp

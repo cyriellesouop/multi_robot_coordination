@@ -41,6 +41,10 @@ struct RunResult
   // task moved away and back counts 0; installed edits count every operation).
   int final_assignment_changes{0};
   bool deviation_realized{false};  // every injected deviation actually happened in this run
+  // Sum over COMPLETED tasks of max(0, end - nominal finish in the initial plan): the delay the
+  // run added to the workflow (the deviation's own delay plus what the method did). Unfinished
+  // tasks are not in it (read it with never_completed), as for the tardiness.
+  TimeMs added_delay_ms{0};
 
   double deadline_miss_rate() const {return deadline_tasks ? double(deadline_misses) / deadline_tasks : 0.0;}
   double completion_rate() const {return total_tasks ? double(completed_tasks) / total_tasks : 0.0;}
@@ -74,6 +78,16 @@ struct PairedSummary
 // Throws std::invalid_argument if the two vectors have different sizes.
 PairedSummary compare(const std::vector<double> & method, const std::vector<double> & baseline,
   std::uint64_t seed = 1, int resamples = 2000);
+
+// The same with CLUSTERED observations: pair i belongs to cluster[i]. Use it when rows that share a
+// cluster are not independent, e.g. pooled factor cells that reuse the same scenario seeds (the
+// seed is the cluster). The paired differences are first averaged per cluster; the bootstrap then
+// resamples those cluster means (cluster bootstrap), and mean_diff is their mean (the pooled mean
+// when every cluster has the same number of rows). n, wins, ties and losses still count rows.
+// With one row per cluster it equals compare() on the same rows. Throws std::invalid_argument if
+// the three vectors have different sizes.
+PairedSummary compare_clustered(const std::vector<double> & method, const std::vector<double> & baseline,
+  const std::vector<std::uint64_t> & cluster, std::uint64_t seed = 1, int resamples = 10000);
 
 }  // namespace dwafp
 

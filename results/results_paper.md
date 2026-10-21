@@ -4,7 +4,7 @@ Living document: every result that may go into the paper, with its configuration
 file and the command that reproduces it. Newest results are added to the relevant section; the
 "Claims" table at the end says what each result supports.
 
-Last update: 2026-10-21 (source-only baseline corrected: now trigger-task-only).
+Last update: 2026-10-21 (repair-location study: Section 1.9).
 
 > **Correction (2026-10-21).** Until this date, the source-only baseline could also edit
 > *overdue descendants* of the deviating task: tasks that the reference says should already have
@@ -32,10 +32,15 @@ colcon build --packages-select actions
 ./build/actions/dwafp_experiments 200 src/results/main_noise0.csv 0      # controlled
 ./build/actions/dwafp_experiments 200 src/results/main_noise10.csv 0.1   # robustness
 ./build/actions/dwafp_experiments sweeps 200 src/results/sweeps.csv > src/results/sweeps.txt   # Section 1.8
+./build/actions/dwafp_experiments location 200 location.csv 0 > src/results/location.txt                      # Section 1.9
+./build/actions/dwafp_experiments location 200 location_latency1s.csv 1000 > src/results/location_latency1s.txt
+gzip -9 location.csv location_latency1s.csv && mv location.csv.gz location_latency1s.csv.gz src/results/   # ~24 MB each unzipped
 ```
 
 `sweeps` runs the five Step 6 experiments of Section 1.8 (about 45 s); each can also be run alone:
-`deadlines`, `noise`, `latency`, `estimator`, `timeout`.
+`deadlines`, `noise`, `latency`, `estimator`, `timeout`. `location` is the repair-location study
+of Section 1.9 (about 100 s per run; last argument: the dispatch latency in ms, the same for every
+method).
 
 | Argument | Meaning |
 |---|---|
@@ -81,6 +86,7 @@ robot); the set A_i. A *downstream edit* edits a task other than the event sourc
 | Misses | deadline misses in one run: tasks that have a deadline and were not completed by it (a task never completed counts as a miss); lower is better |
 | A − B | mean over the 200 scenarios of (misses of A − misses of B), same scenario for both. **Negative = A is better.** Example: −0.34 = A has 0.34 fewer deadline misses per run on average |
 | [95 % CI] | bootstrap 95 % confidence interval of that mean (2000 resamples). If it does not contain 0, the difference is statistically significant; whether it **matters** also depends on its size |
+| Cluster bootstrap | used in 1.9, where pooled rows reuse the same seeds in several factor cells: the paired differences are averaged per seed, and the 200 seed averages are resampled (10 000 resamples). Rows sharing a seed are not independent, so treating them as independent would give too narrow an interval |
 | W / T / L | wins / ties / losses over the 200 scenarios: in how many A had fewer, the same, or more misses than B. 39 / 161 / 0 = better in 39, equal in 161, worse in none |
 | Success | share of runs in which every task completed and every deadline was met |
 | Miss rate | misses / tasks that have a deadline, averaged over runs (comparable across mission sizes) |
@@ -300,7 +306,7 @@ meeting).
 **Finding.** With the corrected baseline, DWAFP beats source-only on transient delays in every
 shape and both deadline structures, with at most 1 loss per 200 scenarios. Handoff-and-final
 deadlines do not enlarge the gap. Which conditions make downstream edits matter is the subject of
-the repair-location study (pending, Section 5).
+the repair-location study (1.9).
 
 #### Duration noise
 
@@ -359,6 +365,129 @@ and halves the transient gain (λ = 3 changes nothing for transient delays, whic
 for every λ. λ = 2 is used for the main results without tuning it for any method. Against
 source-only on transient delays: −0.06 [−0.14, +0.01] (12/183/5) at λ = 1.5, −0.10 at λ = 2 and 3.
 
+### 1.9 Repair location: when does editing downstream of the trigger task matter?
+
+**Question.** DWAFP gains over trigger-task-only repair on transient delays (1.4, 1.8). Does that
+gain come from edits *downstream* of the trigger task, and under which conditions does it occur?
+Hypothesis (from the review): downstream repair helps when restarting or moving a nearly finished
+source is expensive, while an unstarted descendant can still absorb the deviation.
+
+**Design.** Full factorial; every cell uses the same 200 seeds, and every scenario is run under the
+five methods with the **same dispatch latency** for all (0 s primary, 1 s second run):
+
+| Factor | Levels |
+|---|---|
+| Source progress at the deviation | 20 %, 50 %, 80 % of its work |
+| Idle-spare availability | **no spare** / **idle spare**: the same workflow plus one robot without any task. In both, every workflow robot executes a task at the deviation and 2 s later (nominal plan) |
+| Execution-time ratio ρ | 1 (homogeneous), 1.5 (moderate), 3 (high): durations 1 / √ρ / ρ s per unit of work, cyclically (the spare gets √ρ) |
+| Slack of the final deadlines | tight U[0, 0.25], moderate U[0, 0.5], default U[0.5, 3] × the task's duration |
+| Deviation | transient delay, persistent obstruction |
+
+Fixed: deadlines on **final tasks only** (the trigger task has none, so it threatens the mission
+only through its descendants), 4 workflow robots, 20 tasks, random DAG and rendezvous in turn
+(chains and fork-join never keep all 4 robots busy: they run 2 and 3 parallel lines), no noise, 2×
+timeout, nominal estimate. 3 × 2 × 3 × 3 × 2 = 108 cells, 21 600 scenarios, 108 000 runs per
+latency.
+
+**What is compared fairly, and what is not.** The *methods* are always compared on the same
+scenario (paired). Across factor levels:
+- idle-spare availability and slack keep the **same workflow and deviation** (the spare is added
+  after the workflow is drawn; the slack only changes deadlines, which source selection never uses);
+- source progress and ρ change the nominal timing, hence which task is an eligible source, and an
+  ineligible graph is replaced by another one. Differences between their levels are **descriptive
+  associations, not causal factor effects**. A clean factor study would instantiate every factor
+  combination from one fixed workflow template (future work).
+
+Statistics: every interval in this section is a **cluster bootstrap by seed** (10 000 resamples);
+within one cell it equals the ordinary paired bootstrap.
+
+**Columns** (full tables in [location.txt](location.txt) and
+[location_latency1s.txt](location_latency1s.txt), data in `location.csv.gz` and
+`location_latency1s.csv.gz`):
+
+| Column | Meaning |
+|---|---|
+| Threat | scenarios in which no intervention misses a deadline (the only ones where a repair can matter) |
+| Prev S / D | scenarios with at least one **installed** preventive repair: trigger-task-only (S) / DWAFP (D) |
+| Down | share of DWAFP's **installed** preventive repairs that edit a task other than the trigger task |
+| D-only / S-only | scenarios in which only DWAFP / only trigger-task-only succeeds (every deadline met) |
+| Discard | work thrown away by cancelled attempts (s per run) |
+| Added delay | Σ over tasks of max(0, end − nominal finish), s per run, **only over runs in which both methods complete every task** (all 3600 of each slack level for transient delays) |
+| Assignment changes | final assignment changes per run: tasks whose final robot differs from the initial plan (a task moved away and back counts 0) |
+
+#### Results: transient delay, 0 s latency
+
+Pooled over all 18 cells of each slack level (3600 runs each):
+
+| Slack | Threat | Prev S / D | Down | Success S / D | D-only / S-only | DWAFP − trigger-task-only [95 % CI], W/T/L | Discard S / D | Added delay S / D, D − S [95 % CI] | Assignment changes S / D |
+|---|---|---|---|---|---|---|---|---|---|
+| tight | 1964 | 579 / 821 | 91 % | 60 / 65 % | **178 / 1** | **−0.08** [−0.10, −0.06], 203/3394/3 | 0.42 / 0.10 | 9.0 / 8.6, −0.4 [−0.7, −0.2] | 0.21 / 0.31 |
+| moderate | 1762 | 571 / 792 | 92 % | 65 / 70 % | **181 / 2** | **−0.08** [−0.11, −0.06], 206/3385/9 | 0.38 / 0.08 | 9.1 / 8.6, −0.4 [−0.8, −0.1] | 0.19 / 0.30 |
+| default | 280 | 152 / 174 | 94 % | 96 / 97 % | 18 / 0 | −0.01 [−0.01, −0.00], 18/3582/0 | 0.12 / 0.01 | 12.0 / 11.8, −0.1 [−0.4, +0.1] | 0.04 / 0.06 |
+
+With tight slack, DWAFP uniquely succeeded in 178 / 3600 runs (4.94 %; 9.1 % of the 1964
+threatened runs), trigger-task-only in 1 / 3600 (0.03 %).
+
+Tight slack, pooled by factor level (1200 or 1800 runs per line; progress and ρ lines are
+descriptive, see above):
+
+| Factor level | Threat | Down | D-only / S-only | DWAFP − trigger-task-only [95 % CI] | Discard S / D | Added delay D − S [95 % CI] |
+|---|---|---|---|---|---|---|
+| progress 20 % | 710 | 87 % | 63 / 1 | −0.10 [−0.14, −0.06] | 0.41 / 0.14 | −0.2 [−0.8, +0.2] |
+| progress 50 % | 662 | 92 % | 52 / 0 | −0.07 [−0.10, −0.04] | 0.49 / 0.12 | −0.2 [−0.6, +0.1] |
+| progress 80 % | 592 | 96 % | 63 / 0 | −0.08 [−0.11, −0.05] | 0.36 / 0.06 | **−0.8** [−1.3, −0.4] |
+| no spare | 982 | 88 % | 82 / 0 | −0.08 [−0.10, −0.06] | 0.40 / 0.12 | −0.3 [−0.6, −0.1] |
+| idle spare | 982 | 94 % | 96 / 1 | −0.08 [−0.11, −0.06] | 0.44 / 0.09 | −0.5 [−0.8, −0.2] |
+| ρ = 1 (homogeneous) | 750 | 94 % | 14 / 0 | −0.03 [−0.05, −0.01] | 0.21 / 0.04 | −0.3 [−0.6, −0.1] |
+| ρ = 1.5 | 664 | 96 % | **106 / 1** | **−0.15** [−0.21, −0.10] | 0.33 / 0.06 | **−1.1** [−1.6, −0.7] |
+| ρ = 3 | 550 | 86 % | 58 / 0 | −0.06 [−0.10, −0.04] | 0.72 / 0.21 | +0.1 [−0.5, +0.8] |
+
+With **1 s latency** (tight slack, all cells): DWAFP − trigger-task-only **−0.13** [−0.17, −0.10],
+281/3310/9, D-only / S-only 245 / 5, down 94 %, discard 0.41 / 0.10 s, added delay 9.7 / 8.9 s
+(−0.8 [−1.2, −0.5]). By progress: 20 % −0.13, 50 % −0.11, **80 % −0.16** (added delay −1.4 s).
+
+DWAFP against mission-wide: **0 wins / all ties / 0 losses** in every cell and pooled line (both
+latencies, both deviation types; 21 600 / 21 600 ties per latency).
+
+#### Results: persistent obstruction
+
+At 0 s latency, DWAFP and trigger-task-only give **identical outcomes in every cell** (0 %
+downstream edits). The obstructed source never finishes on its robot, so its output exists only if
+the source itself moves; under the single-edit model no edit of a descendant can restore it. At 1 s
+latency the same holds except with moderate slack, where 1 % of DWAFP's preventive repairs are
+downstream and DWAFP wins 13 of 3600 runs (−0.01 [−0.02, 0.00], no loss).
+
+#### Reading
+
+1. **Downstream repair is frequent.** When a transient delay threatens a final deadline, 87–96 % of
+   DWAFP's installed preventive repairs edit a task other than the trigger task. DWAFP made a
+   preventive repair in 821 runs, trigger-task-only in 579 (tight slack, 0 s).
+2. **Cost: less discarded work and less added delay, more assignment changes.** DWAFP throws away
+   about 4× less work (0.10 vs 0.42 s per run) and adds less delay to the workflow (−0.4 s per run,
+   over runs where both complete every task), but makes more final assignment changes (0.31 vs
+   0.21 per run): it moves an unstarted descendant instead of restarting the running trigger task.
+3. **The largest observed separation occurred under moderate execution-time heterogeneity**
+   (ρ = 1.5: −0.15, 106 / 1). With homogeneous robots it is small (−0.03, 14 / 0), with ρ = 3
+   smaller again (−0.06), where trigger-task-only makes more preventive repairs (255 vs 175 runs).
+   This is an association: ρ also changes which scenarios are generated.
+4. **Source progress.** Without latency the miss reduction is similar at 20 / 50 / 80 % progress;
+   at 80 % the added-delay saving is the largest (−0.8 s) and almost no work is discarded
+   (0.06 s). With 1 s latency the miss reduction is also largest at 80 % (−0.16). This is
+   consistent with the hypothesis, as an association.
+5. **Idle-spare availability makes no clear difference** (−0.08 in both; this comparison uses the
+   same workflows and deviations).
+6. **With default (loose) slack, few delays threaten anything** (280 of 3600 runs), and the gain is
+   tiny (−0.01). The comparison is informative only when the deviation threatens a deadline.
+
+Suggested text: *"In 200 controlled transient-delay scenarios, repair-region search reduced
+deadline misses by 0.10 per run relative to trigger-task-only repair (paired 95 % CI
+[−0.15, −0.04]; 14 improved, 186 tied, none worse). In the repair-location study, 91 % of DWAFP's
+installed preventive repairs targeted a task other than the trigger task; these downstream edits
+discarded less work and uniquely recovered 178 of 3600 tight-slack runs, whereas trigger-task-only
+repair uniquely recovered one. The largest observed separation occurred under moderate
+execution-time heterogeneity. No advantage occurred for persistent obstructions, because the
+source output could not be recovered by editing a downstream task under the single-edit model."*
+
 ---
 
 ## 2. Stage I at the prediction level (open loop, earlier)
@@ -398,7 +527,8 @@ One row per claim the paper may make. Evidence: the sections supporting it. Stat
 | The benefit is robust to duration noise | 1.3, 1.8: stable from 0 to 20 % noise | **Supported** |
 | The benefit does not depend on the blockage estimator | 1.8: nominal and conservative give the same gains | **Supported** (nominal has fewer unneeded edits) |
 | The gain over reactive depends on the execution timeout | 1.8: −1.15 / −2.06 / −3.00 for λ = 1.5 / 2 / 3 (persistent) | **Reported** (λ = 2 untuned) |
-| Dependency-aware repair outperforms trigger-task-only repair | 1.4: −0.10 [−0.15, −0.04] (14/186/0) on transient delays; 1.8: every shape, deadline structure, noise level and latency | **Supported for transient delays**; persistent obstructions: identical by construction (1.4) |
+| Dependency-aware repair outperforms trigger-task-only repair | 1.4: −0.10 [−0.15, −0.04] (14/186/0) on transient delays; 1.8: every shape, deadline structure, noise level and latency; 1.9: 178 / 1 runs recovered only by DWAFP / only by trigger-task-only, 91 % downstream edits, 4× less discarded work | **Supported for transient delays**; persistent obstructions: no advantage (single-edit model, 1.9) |
+| Downstream repair matters more under some conditions | 1.9: largest separation under moderate execution-time heterogeneity (ρ = 1.5: −0.15); largest added-delay saving at 80 % source progress | **Observed (descriptive association)**; no causal factor claim |
 | Local search preserves global single-edit quality | 1.4: 2000 ties; 2: 100 % kept | **Promising** (single-deviation scenarios only) |
 | Local search substantially reduces computation | 1.6: small difference at 20 tasks; 2: −40 % candidates | **Pending** (closed-loop scaling) |
 | No harmful or unneeded preventive edits | 1.2: none without noise; 1.3: 7 unneeded / 200 transient runs with noise | **Supported**, with the noise caveat |
@@ -417,6 +547,10 @@ One row per claim the paper may make. Evidence: the sections supporting it. Stat
    DWAFP.
 4. **Tardiness** is of completed tasks only; always read it together with the completion rate.
    **Makespan** is compared only over runs where every task completed.
+5. **Factor effects in 1.9 are associations.** Progress and the execution-time ratio change which
+   scenarios are generated; say "the largest observed separation occurred under …", not "…
+   caused". Downstream shares count installed preventive repairs; say "final assignment changes",
+   not "reassignments".
 
 ---
 
@@ -424,12 +558,13 @@ One row per claim the paper may make. Evidence: the sections supporting it. Stat
 
 Done: deadline structure, noise sweep, dispatch latency, estimator, execution timeout (1.8).
 
+Done (1.9): repair-location factorial study.
+
 Still to run:
-1. Repair-location factorial study: when do downstream edits matter (final-only deadlines, source
-   progress, idle-spare availability, execution-time ratio, slack, the same latency for every
-   method)?
-2. Closed-loop scaling, weak scaling N = qR with R ∈ {3, 6, 9, 12} and q ≈ 5 or 10 tasks per robot,
+1. Closed-loop scaling, weak scaling N = qR with R ∈ {3, 6, 9, 12} and q ≈ 5 or 10 tasks per robot,
    homogeneous rates (optionally fixed N with varying R): region share, validation-horizon share,
    candidates per decision for DWAFP and mission-wide, decision-time p50 / p95 / p99, miss
    difference DWAFP − mission-wide; release build, with processor, compiler and optimization flags.
-3. Failure taxonomy of the events DWAFP cannot prevent (7 classes, with a pair oracle).
+2. Failure taxonomy of the events DWAFP cannot prevent (7 classes, with a pair oracle).
+3. Later (extended paper): a factor study from one fixed workflow template, so that progress and
+   the execution-time ratio can be varied on identical workflows.

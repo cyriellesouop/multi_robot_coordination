@@ -35,12 +35,15 @@
 //   estimator : nominal vs conservative remaining-time estimate while blocked
 //   timeout   : execution timeout 1.5, 2, 3 x the nominal duration
 //   sweeps    : all of the above
+// Usage, repair-location study (its own configuration, see exp_location):
+//   ros2 run actions dwafp_experiments location [runs] [csv_file|-] [latency_ms]   (default 0 ms)
 
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>  // std::begin, std::end
 #include <map>
 #include <string>
 #include <vector>
@@ -96,7 +99,9 @@ void write_csv_header(std::ofstream & csv)
          "deadline_misses,never_completed,success,completed_task_tardiness_ms,makespan_ms,timeouts,"
          "final_assignment_changes,edits_scheduled,edits_installed,edits_rejected,discarded_work_ms,"
          "wasted_elapsed_ms,trigger_events,analyses,preventive_repairs,no_feasible_local,no_single_edit,"
-         "fallback_events,fallback_repairs,errors,decision_us,max_decision_us\n";
+         "fallback_events,fallback_repairs,errors,decision_us,max_decision_us,"
+         "progress_lo,progress_hi,execution_time_ratio,spare_robots,busy_fleet,added_delay_ms,preventive_downstream,"
+         "preventive_installed,preventive_downstream_installed\n";
 }
 
 void write_csv_row(std::ofstream & csv, const std::string & experiment, const Scenario & s,
@@ -114,7 +119,10 @@ void write_csv_row(std::ofstream & csv, const std::string & experiment, const Sc
       << r.edits_rejected << ',' << r.discarded_work_ms << ',' << r.wasted_elapsed_ms << ','
       << st.trigger_events << ',' << st.analyses << ',' << st.preventive_repairs << ','
       << st.no_feasible_local << ',' << st.no_single_edit << ',' << st.fallback_events << ','
-      << st.fallback_repairs << ',' << st.errors << ',' << st.decision_us << ',' << st.max_decision_us << '\n';
+      << st.fallback_repairs << ',' << st.errors << ',' << st.decision_us << ',' << st.max_decision_us << ','
+      << c.progress_lo << ',' << c.progress_hi << ',' << c.execution_time_ratio << ',' << c.spare_robots << ','
+      << c.busy_fleet << ',' << r.added_delay_ms << ',' << st.preventive_downstream << ','
+      << st.preventive_installed << ',' << st.preventive_downstream_installed << '\n';
 }
 
 // Outcomes per method (means per run; rates normalized by the tasks concerned).
@@ -242,17 +250,19 @@ const DevType kBreakdown{"robot breakdown", {0, 0, 0, 1}};
 const DevType kMix{"mix 35/25/25/15", DeviationMix{}};
 const WorkflowShape kShapes[] = {WorkflowShape::kRandomDag, WorkflowShape::kChains,
   WorkflowShape::kForkJoin, WorkflowShape::kRendezvous};
+const std::vector<WorkflowShape> kAllShapes(std::begin(kShapes), std::end(kShapes));
 
 // Runs `runs` paired scenarios (seeds 1..runs) of one setting for one deviation type: every
-// scenario under the five methods. With cycle_shapes, the four shapes in turn (seed mod 4).
+// scenario under the five methods. The shapes of `shapes` are used in turn (seed mod their
+// number; kAllShapes = the four shapes, as in the main comparison); empty = the shape of `base`.
 std::vector<Row> run_setting(const std::string & experiment, ScenarioConfig base, const ControllerConfig & controller,
-  const DevType & type, int runs, bool cycle_shapes, std::ofstream * csv, int & errors)
+  const DevType & type, int runs, const std::vector<WorkflowShape> & shapes, std::ofstream * csv, int & errors)
 {
   std::vector<Row> rows;
   for (int i = 1; i <= runs; ++i) {
     ScenarioConfig c = base;
     c.mix = type.mix;
-    if (cycle_shapes) {c.shape = kShapes[static_cast<std::size_t>(i % 4)];}
+    if (!shapes.empty()) {c.shape = shapes[static_cast<std::size_t>(i) % shapes.size()];}
     const auto seed = static_cast<std::uint64_t>(i);
     const Scenario s = make_scenario(c, seed);
     Row row;
@@ -325,7 +335,7 @@ void exp_deadlines(int runs, std::ofstream * csv, int & errors)
       ScenarioConfig c = controlled_scenario();
       c.deadlines = d;
       summary_row(deadline_structure_name(d), t,
-        run_setting(std::string("deadlines:") + deadline_structure_name(d), c, controller_config(Method::kDwafp), t, runs, true, csv, errors));
+        run_setting(std::string("deadlines:") + deadline_structure_name(d), c, controller_config(Method::kDwafp), t, runs, kAllShapes, csv, errors));
     }
   }
   std::printf("\n### deadlines per workflow shape (delays only)\n");
@@ -337,7 +347,7 @@ void exp_deadlines(int runs, std::ofstream * csv, int & errors)
         c.shape = shape;
         c.deadlines = d;
         const std::string label = std::string(shape_name(shape)) + " / " + deadline_structure_name(d);
-        summary_row(label, t, run_setting("deadlines-shape:" + label, c, controller_config(Method::kDwafp), t, runs, false, csv, errors));
+        summary_row(label, t, run_setting("deadlines-shape:" + label, c, controller_config(Method::kDwafp), t, runs, {}, csv, errors));
       }
     }
   }
@@ -352,7 +362,7 @@ void exp_noise(int runs, std::ofstream * csv, int & errors)
       ScenarioConfig c = controlled_scenario();
       c.noise = noise;
       const std::string label = std::to_string(static_cast<int>(100 * noise + 0.5)) + " %";
-      summary_row(label, t, run_setting("noise:" + label, c, controller_config(Method::kDwafp), t, runs, true, csv, errors));
+      summary_row(label, t, run_setting("noise:" + label, c, controller_config(Method::kDwafp), t, runs, kAllShapes, csv, errors));
     }
   }
 }
@@ -366,7 +376,7 @@ void exp_latency(int runs, std::ofstream * csv, int & errors)
       ControllerConfig cc = controller_config(Method::kDwafp);
       cc.dispatch_ms = latency;
       const std::string label = std::to_string(latency / 1000) + " s";
-      summary_row(label, t, run_setting("latency:" + label, controlled_scenario(), cc, t, runs, true, csv, errors));
+      summary_row(label, t, run_setting("latency:" + label, controlled_scenario(), cc, t, runs, kAllShapes, csv, errors));
     }
   }
 }
@@ -379,7 +389,7 @@ void exp_estimator(int runs, std::ofstream * csv, int & errors)
     for (const DevType & t : {kTransient, kPersistent}) {
       ControllerConfig cc = controller_config(Method::kDwafp);
       cc.estimate = e;
-      summary_row(estimate_name(e), t, run_setting(std::string("estimator:") + estimate_name(e), controlled_scenario(), cc, t, runs, true, csv, errors));
+      summary_row(estimate_name(e), t, run_setting(std::string("estimator:") + estimate_name(e), controlled_scenario(), cc, t, runs, kAllShapes, csv, errors));
     }
   }
 }
@@ -394,7 +404,210 @@ void exp_timeout(int runs, std::ofstream * csv, int & errors)
       c.timeout_multiplier = lambda;
       char label[16];
       std::snprintf(label, sizeof label, "%.1fx", lambda);
-      summary_row(label, t, run_setting(std::string("timeout:") + label, c, controller_config(Method::kDwafp), t, runs, true, csv, errors));
+      summary_row(label, t, run_setting(std::string("timeout:") + label, c, controller_config(Method::kDwafp), t, runs, kAllShapes, csv, errors));
+    }
+  }
+}
+
+// =============================================================================================
+// Repair-location study: when does repairing DOWNSTREAM of the trigger task matter?
+// =============================================================================================
+//
+// Hypothesis: a downstream repair becomes useful when restarting or moving a nearly completed
+// source is expensive, while modifying an unstarted descendant can absorb the deviation. Full
+// factorial design, every cell on the same seeds:
+//   source progress      : 20 / 50 / 80 % of the source's work done when the deviation happens
+//   idle-spare availability: no spare vs one idle spare robot (the same workflow plus one robot
+//                       without any task); in both, every WORKFLOW robot executes a task at the
+//                       deviation and 2 s later (busy_fleet)
+//   execution-time ratio rho: 1 (homogeneous), 1.5 (moderate), 3 (high): durations 1 / sqrt(rho)
+//                       / rho s per unit of work
+//   slack of the final deadlines, x the task's duration: tight U[0, 0.25], moderate U[0, 0.5],
+//                       default U[0.5, 3] (with the default, few delays threaten anything)
+// Fixed: deadlines on final tasks only (the source has none), random DAG and rendezvous in turn
+// (chains and fork-join never keep every robot busy: they run fewer parallel lines than robots),
+// no noise, the same dispatch latency for every method, everything else as in the controlled
+// configuration. Deviations: transient delay and persistent obstruction (the preventive cases).
+//
+// What is paired: the METHODS, always (same scenario). Across factor levels, the spare and the
+// slack keep the same workflow and deviation (the spare is added after the workflow is drawn; the
+// slack only changes deadlines, which source selection never uses); progress and rho do not (they
+// change the nominal timing, hence which task is an eligible source, and failed eligibility draws
+// another graph). Differences between factor levels are therefore DESCRIPTIVE associations.
+//
+// Statistics: pooled lines reuse the same seeds in several cells, so every interval of this study
+// is a cluster bootstrap by seed (compare_clustered, 10 000 resamples); within one cell it equals
+// the ordinary paired bootstrap.
+
+constexpr int kReactive = 1;
+constexpr int kSource = 2;
+constexpr int kWide = 4;
+constexpr int kLocationResamples = 10000;
+
+void location_header(const char * first)
+{
+  std::printf("  %-24s %-22s %-6s %-9s %-5s %-9s %-11s %-35s %-11s %-38s %-11s %-10s %s\n", first, "deviation",
+    "threat", "prev S/D", "down", "succ S/D", "Donly/Sonly", "DWAFP-trigger-only [95% CI] W/T/L", "discard S/D",
+    "added delay S/D  D-S [95% CI] (joint)", "asgChg S/D", "D-M W/T/L", "D-R");
+}
+
+// One line of the study, over `rows` (every row a scenario, its seed the bootstrap cluster).
+//   threat      = scenarios in which no intervention misses a deadline (the only ones where a
+//                 repair can matter)
+//   prev S/D    = scenarios with at least one INSTALLED preventive repair (trigger-task-only / DWAFP)
+//   down        = share of DWAFP's installed preventive repairs that edit a task other than the
+//                 trigger task (a downstream edit)
+//   succ S/D    = success % (every task completed, every deadline met)
+//   Donly/Sonly = scenarios that only DWAFP / only trigger-task-only completes with success
+//   DWAFP-trigger-only = paired difference in misses per run, cluster-bootstrap 95 % CI, W/T/L
+//   discard     = work thrown away by cancelled attempts (s per run)
+//   added delay = sum over tasks of max(0, end - nominal finish), s per run, ONLY over the
+//                 scenarios in which both methods complete every task ("joint", count printed:
+//                 otherwise a method could look better by leaving tasks unfinished)
+//   asgChg      = final assignment changes: tasks whose final robot differs from the initial plan
+//   D-M W/T/L   = DWAFP against mission-wide, wins / ties / losses in misses
+//   D-R         = DWAFP - reactive, misses per run
+void location_row(const std::string & label, const DevType & type, const std::vector<Row> & rows)
+{
+  const double n = static_cast<double>(std::max<std::size_t>(1, rows.size()));
+  const auto mean = [&](int k, auto metric) {
+      double acc = 0;
+      for (const Row & row : rows) {acc += metric(row.result[k]);}
+      return acc / n;
+    };
+  const auto misses = [](const RunResult & r) {return static_cast<double>(r.deadline_misses);};
+  const auto added_s = [](const RunResult & r) {return static_cast<double>(r.added_delay_ms) / 1000.0;};
+  const auto discarded_s = [](const RunResult & r) {return static_cast<double>(r.discarded_work_ms) / 1000.0;};
+  const auto changes = [](const RunResult & r) {return static_cast<double>(r.final_assignment_changes);};
+  const auto success = [](const RunResult & r) {return r.success ? 100.0 : 0.0;};
+  // Paired comparison of method a against b on `metric`, clustered by seed, over the rows kept.
+  const auto paired = [&](int a, int b, auto metric, auto keep) {
+      std::vector<double> va, vb;
+      std::vector<std::uint64_t> seeds;
+      for (const Row & row : rows) {
+        if (!keep(row)) {continue;}
+        va.push_back(metric(row.result[a]));
+        vb.push_back(metric(row.result[b]));
+        seeds.push_back(row.seed);
+      }
+      return compare_clustered(va, vb, seeds, 1, kLocationResamples);
+    };
+  const auto all_rows = [](const Row &) {return true;};
+  const auto joint = [](const Row & row) {
+      return row.result[kSource].all_completed() && row.result[kDwafp].all_completed();
+    };
+
+  int threat = 0, prev_s = 0, prev_d = 0, installed = 0, downstream = 0, d_only = 0, s_only = 0, n_joint = 0;
+  double added_s_joint = 0, added_d_joint = 0;
+  for (const Row & row : rows) {
+    const RunResult & src = row.result[kSource];
+    const RunResult & d = row.result[kDwafp];
+    threat += row.result[kNone].deadline_misses > 0 ? 1 : 0;
+    prev_s += src.stats.preventive_installed > 0 ? 1 : 0;
+    prev_d += d.stats.preventive_installed > 0 ? 1 : 0;
+    installed += d.stats.preventive_installed;
+    downstream += d.stats.preventive_downstream_installed;
+    d_only += (d.success && !src.success) ? 1 : 0;
+    s_only += (src.success && !d.success) ? 1 : 0;
+    if (joint(row)) {
+      ++n_joint;
+      added_s_joint += added_s(src);
+      added_d_joint += added_s(d);
+    }
+  }
+  const PairedSummary vs = paired(kDwafp, kSource, misses, all_rows);
+  const PairedSummary delay = paired(kDwafp, kSource, added_s, joint);
+  const PairedSummary vm = paired(kDwafp, kWide, misses, all_rows);
+  const PairedSummary vr = paired(kDwafp, kReactive, misses, all_rows);
+
+  char down[16], prev[24], succ[16], only[16], a[64], disc[24], add[72], chg[24], dm[24];
+  if (installed > 0) {std::snprintf(down, sizeof down, "%3.0f%%", 100.0 * downstream / installed);} else {std::snprintf(down, sizeof down, "  -");}
+  std::snprintf(prev, sizeof prev, "%d/%d", prev_s, prev_d);
+  std::snprintf(succ, sizeof succ, "%.0f/%.0f", mean(kSource, success), mean(kDwafp, success));
+  std::snprintf(only, sizeof only, "%d/%d", d_only, s_only);
+  std::snprintf(a, sizeof a, "%+5.2f [%+5.2f,%+5.2f] %3d/%3d/%d", vs.mean_diff, vs.ci_lo, vs.ci_hi, vs.wins, vs.ties, vs.losses);
+  std::snprintf(disc, sizeof disc, "%.2f/%.2f", mean(kSource, discarded_s), mean(kDwafp, discarded_s));
+  const double nj = std::max(1, n_joint);
+  std::snprintf(add, sizeof add, "%.1f/%.1f %+5.1f [%+5.1f,%+5.1f] (%d)", added_s_joint / nj, added_d_joint / nj,
+    delay.mean_diff, delay.ci_lo, delay.ci_hi, n_joint);
+  std::snprintf(chg, sizeof chg, "%.2f/%.2f", mean(kSource, changes), mean(kDwafp, changes));
+  std::snprintf(dm, sizeof dm, "%d/%d/%d", vm.wins, vm.ties, vm.losses);
+  std::printf("  %-24s %-22s %-6d %-9s %-5s %-9s %-11s %-35s %-11s %-38s %-11s %-10s %+5.2f\n", label.c_str(), type.name,
+    threat, prev, down, succ, only, a, disc, add, chg, dm, vr.mean_diff);
+}
+
+void exp_location(int runs, std::ofstream * csv, int & errors, TimeMs latency_ms)
+{
+  struct Slack {const char * name; double lo; double hi;};
+  const Slack slacks[] = {{"tight", 0.0, 0.25}, {"moderate", 0.0, 0.5}, {"default", 0.5, 3.0}};
+  const double progresses[] = {0.2, 0.5, 0.8};
+  const bool spares[] = {false, true};
+  const double ratios[] = {1.0, 1.5, 3.0};
+  const std::vector<WorkflowShape> shapes{WorkflowShape::kRandomDag, WorkflowShape::kRendezvous};
+  ControllerConfig cc = controller_config(Method::kDwafp);
+  cc.dispatch_ms = latency_ms;  // the same latency for every method
+
+  std::printf("\n### location: repair location vs source progress, idle-spare availability and execution-time ratio\n");
+  std::printf("4 workflow robots, each busy at the deviation (+1 idle spare robot in 'idle spare', duration sqrt(rho)), 20 tasks,\n"
+    "random DAG and rendezvous in turn, deadlines on final tasks only, no noise, 2x timeout, dispatch latency %lld ms\n"
+    "for every method, nominal estimate. rho = execution-time ratio (durations 1 / sqrt(rho) / rho s per unit).\n"
+    "S = trigger-task-only (source-only) repair, D = DWAFP, M = mission-wide, R = reactive. 95%% CIs: cluster\n"
+    "bootstrap by seed, %d resamples. Columns: threat = runs where no intervention misses a deadline; prev = runs with\n"
+    "an installed preventive repair; down = share of DWAFP's installed preventive repairs that edit a task other than\n"
+    "the trigger task; succ = success %%; Donly/Sonly = runs only D / only S completes on time; DWAFP-trigger-only =\n"
+    "paired difference in misses per run; discard = work thrown away (s/run); added delay = delay added to the tasks\n"
+    "w.r.t. the nominal plan (s/run), only over runs where S and D both complete every task (their number in\n"
+    "brackets); asgChg = final assignment changes per run; D-M W/T/L = DWAFP vs mission-wide; D-R = DWAFP - reactive.\n",
+    static_cast<long long>(latency_ms), kLocationResamples);
+  for (const DevType & t : {kTransient, kPersistent}) {
+    for (const Slack & slack : slacks) {
+      // Every cell's rows, kept for the pooled lines below the table.
+      struct Cell {double progress; bool spare; double rho; std::vector<Row> rows;};
+      std::vector<Cell> cells;
+      std::printf("\n%s, %s slack U[%.2f, %.2f]\n", t.name, slack.name, slack.lo, slack.hi);
+      location_header("progress spare rho");
+      for (const double progress : progresses) {
+        for (const bool spare : spares) {
+          for (const double rho : ratios) {
+            ScenarioConfig c = controlled_scenario();
+            c.deadlines = DeadlineStructure::kFinalOnly;
+            c.slack_lo = slack.lo;
+            c.slack_hi = slack.hi;
+            c.busy_fleet = true;  // the workflow robots are busy; the spare (if any) is idle
+            c.spare_robots = spare ? 1 : 0;
+            c.progress_lo = c.progress_hi = progress;
+            c.execution_time_ratio = rho;
+            char label[32];
+            std::snprintf(label, sizeof label, "%2.0f%% %-10s %.1f", 100 * progress, spare ? "idle spare" : "no spare", rho);
+            cells.push_back({progress, spare, rho,
+              run_setting(std::string("location:") + slack.name + " " + label, c, cc, t, runs, shapes, csv, errors)});
+            location_row(label, t, cells.back().rows);
+          }
+        }
+      }
+      // Pooled over the other two factors (descriptive; clustered by seed, see above).
+      const auto pooled = [&](auto keep) {
+          std::vector<Row> all;
+          for (const Cell & cell : cells) {
+            if (keep(cell)) {all.insert(all.end(), cell.rows.begin(), cell.rows.end());}
+          }
+          return all;
+        };
+      std::printf("  -- pooled over the other factors --\n");
+      for (const double progress : progresses) {
+        char label[32];
+        std::snprintf(label, sizeof label, "progress %.0f%%", 100 * progress);
+        location_row(label, t, pooled([&](const Cell & cell) {return cell.progress == progress;}));
+      }
+      for (const bool spare : spares) {
+        location_row(spare ? "idle spare" : "no spare", t, pooled([&](const Cell & cell) {return cell.spare == spare;}));
+      }
+      for (const double rho : ratios) {
+        char label[32];
+        std::snprintf(label, sizeof label, "rho %.1f", rho);
+        location_row(label, t, pooled([&](const Cell & cell) {return cell.rho == rho;}));
+      }
+      location_row("all cells", t, pooled([](const Cell &) {return true;}));
     }
   }
 }
@@ -487,7 +700,7 @@ int main(int argc, char ** argv)
     const int runs = argc > 2 ? std::max(1, std::atoi(argv[2])) : 200;
     std::ofstream csv_file;
     std::ofstream * csv = nullptr;
-    if (argc > 3) {
+    if (argc > 3 && std::string(argv[3]) != "-") {  // "-" = no CSV (to give a latency only)
       csv_file.open(argv[3]);
       if (!csv_file) {
         std::fprintf(stderr, "cannot write %s\n", argv[3]);
@@ -497,6 +710,15 @@ int main(int argc, char ** argv)
       write_csv_header(*csv);
     }
     std::printf("DWAFP Step 6 experiment '%s': %d paired runs per setting and deviation type\n", name.c_str(), runs);
+    if (name == "location") {
+      // Its own configuration (printed by exp_location); optional 4th argument: latency in ms.
+      const TimeMs latency = argc > 4 ? std::max(0, std::atoi(argv[4])) : 0;
+      int errors = 0;
+      exp_location(runs, csv, errors, latency);
+      std::printf("\ncontroller errors (must be 0): %d\n", errors);
+      if (csv) {std::printf("CSV written to %s\n", argv[3]);}
+      return errors == 0 ? 0 : 1;
+    }
     std::printf("Everything else as in the controlled configuration (4 robots, 20 tasks, every-task deadlines,\n"
       "slack 0.5-3, no noise, 2x timeout, no latency, nominal estimate, k=3, eps=0, tau=2 s).\n"
       "Columns: success of reactive / source-only / DWAFP; deadline-miss rate of reactive / DWAFP; paired\n"
